@@ -35,7 +35,7 @@ import mlflow
 
 cfg = {
     # ---- Dataset ----
-    "dataset_root": "/app/data/ThirtyMusic/",
+    "dataset_root": "/home/jovyan/work/data/ThirtyMusic/",  # root directory of the unzipped 30Music dataset
     "sample_sessions":      None,      # max sessions to parse (None = full dataset)
     "sample_events":        200_000,     # max play events to parse (None = full)
 
