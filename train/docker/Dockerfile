@@ -2,12 +2,15 @@ FROM quay.io/jupyter/pytorch-notebook:cuda12-python-3.12
 
 USER root
 
-# 1. Install system tools for H100 & data extraction
+# 1. Install system tools and gdown for Google Drive downloads
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    nvtop tar gzip wget gnupg build-essential && \
+    nvtop tar gzip wget gnupg build-essential python3-pip && \
     rm -rf /var/lib/apt/lists/*
 
-# 2. Latest CUDA Toolkit for H100 (Hopper) Support
+# Install gdown specifically for the large Drive file
+RUN python3 -m pip install --no-cache-dir gdown
+
+# 2. Latest CUDA Toolkit for H100 (Hopper)
 RUN wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb && \
     dpkg -i cuda-keyring_1.1-1_all.deb && \
     apt-get update && \
@@ -18,12 +21,13 @@ ENV CUDA_HOME=/usr/local/cuda
 ENV PATH="${CUDA_HOME}/bin:${PATH}"
 ENV LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}"
 
-# 3. Setup Project Directory
 WORKDIR /home/${NB_USER}/work
 
-# 4. Handle the Dataset 
-# This assumes ThirtyMusic.tar.gz is in the root of your cloned repo
-COPY ThirtyMusic.tar.gz .
+# 3. Download Dataset from Google Drive
+# The ID is extracted from your link: 1n2aaVgfUgz_8Uif4hCmI5meyX4jDhI6u
+RUN gdown 1n2aaVgfUgz_8Uif4hCmI5meyX4jDhI6u -O ThirtyMusic.tar.gz
+
+# 4. Extract Dataset
 RUN mkdir -p data/ThirtyMusic && \
     tar -xzf ThirtyMusic.tar.gz -C data/ThirtyMusic --strip-components=1 && \
     rm ThirtyMusic.tar.gz
@@ -32,15 +36,13 @@ RUN mkdir -p data/ThirtyMusic && \
 COPY . .
 
 # 6. Install Dependencies
-# Using the requirements.txt from your repo
 RUN python -m pip install --no-cache-dir --upgrade pip wheel setuptools && \
     python -m pip install --no-cache-dir -r train/requirements.txt
 
 USER ${NB_UID}
 
-# Set internal path for your script
 ENV MLFLOW_TRACKING_URI="http://129.114.27.248:8000"
 
-# Fix permissions for the Jupyter user
+# Fix permissions
 RUN fix-permissions "${CONDA_DIR}" && \
     fix-permissions "/home/${NB_USER}"
