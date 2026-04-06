@@ -6,3 +6,4 @@ torchvision
 tqdm
 optuna
 psutil
+gdown
