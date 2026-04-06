@@ -12,6 +12,7 @@ Key changes from original:
   - Early stopping on session HR
   - Negative sampling moved to collate_fn (batched, faster)
   - Dead config keys removed
+  - Serving speed tracked per predict_top_n call (mean/p50/p95/p99/max/QPS)
 
 Requirements
 ------------
@@ -86,12 +87,12 @@ cfg = {
     "lr_step_size":          7,
     "lr_gamma":              0.5,
     "grad_accum_steps":      1,          # was 10 — only useful when batch is tiny
-    "patience":              5,          # NEW: early stopping patience (epochs without improvement)
+    "patience":              5,          # early stopping patience (epochs without improvement)
 
     # ---- Evaluation ----
     "top_n":                 20,
     "eval_every_n_epochs":   5,          # evaluate every N epochs (was hardcoded to 5)
-    "eval_batch_size":       256,        # NEW: batch size for evaluation forward passes
+    "eval_batch_size":       256,        # batch size for evaluation forward passes
 
     # ---- Temporal split ----
     "test_fraction":         0.2,
@@ -120,7 +121,7 @@ log = logging.getLogger(__name__)
 
 
 # ============================================================
-# CACHE HELPERS  (were referenced but never defined in original)
+# CACHE HELPERS
 # ============================================================
 
 def _cache_key(cfg: dict) -> str:
@@ -285,7 +286,6 @@ def parse_sessions(filepath: str, cfg: dict) -> list:
                     pass
 
             if linked is None and raw_props:
-                # Try splitting two concatenated JSON objects
                 brace_depth, split_pos = 0, -1
                 for ci, ch in enumerate(raw_props):
                     if ch == "{":
@@ -379,7 +379,6 @@ def filter_data(session_df, interaction_df, cfg: dict):
 
     engaged_df = interaction_df[~interaction_df["skipped"]].copy()
 
-    # Filter session lengths
     lengths    = engaged_df.groupby("session_id").size().reset_index(name="engaged_length")
     session_df = session_df.merge(lengths, on="session_id", how="left")
     session_df["engaged_length"] = session_df["engaged_length"].fillna(0).astype(int)
@@ -390,7 +389,6 @@ def filter_data(session_df, interaction_df, cfg: dict):
     ]["session_id"]
     engaged_df = engaged_df[engaged_df["session_id"].isin(valid_sessions)]
 
-    # Iterative co-filtering
     for _ in range(5):
         prev = len(engaged_df)
         item_counts = engaged_df["track_id"].value_counts()
@@ -429,7 +427,6 @@ def build_sequences(interaction_df, item2idx: dict, user2idx: dict) -> list:
         ratios    = group["playratio"].tolist()
         item_idxs = [item2idx[i] for i in item_ids if i in item2idx]
 
-        # Normalise playratio to [0, 1] — prevents 10x loss spikes from raw values
         clean_ratios = []
         for r in ratios:
             try:
@@ -461,7 +458,7 @@ def temporal_split(session_df, sequences: list, cfg: dict):
 
 
 # ============================================================
-# DATASET  — negative sampling moved out of __getitem__
+# DATASET
 # ============================================================
 
 class SessionDataset(Dataset):
@@ -479,7 +476,6 @@ class SessionDataset(Dataset):
             user   = seq["user_idx"]
             for t in range(1, len(items)):
                 weight = float(ratios[t]) if use_playratio_weight else 1.0
-                # Clamp to avoid zero-weight samples dominating in opposite direction
                 weight = max(weight, 0.1)
                 self.samples.append((items[:t], user, items[t], weight))
 
@@ -499,20 +495,18 @@ class SessionDataset(Dataset):
 def make_collate_fn(num_items: int, num_negatives: int):
     """
     Returns a collate_fn that:
-      1. Right-pads sequences (consistent with pack_padded_sequence)
+      1. Left-pads sequences (consistent with pack_padded_sequence)
       2. Samples negatives once per batch (faster than per-item)
     """
     def collate_fn(batch):
         max_len  = max(b["prefix"].size(0) for b in batch)
         B        = len(batch)
 
-        # Right-pad (pad left side with zeros, sequence on the right)
         prefixes = torch.zeros(B, max_len, dtype=torch.long)
         for i, b in enumerate(batch):
             L = b["prefix"].size(0)
-            prefixes[i, max_len - L:] = b["prefix"]   # left-pad → sequence at end
+            prefixes[i, max_len - L:] = b["prefix"]
 
-        # Sample one set of negatives for the whole batch
         negatives = torch.randint(1, num_items + 1, (B, num_negatives))
 
         return {
@@ -537,7 +531,7 @@ class GRU4Rec(nn.Module):
         hidden_dim            = cfg["hidden_dim"]
 
         self.item_emb = nn.Embedding(num_items + 1, embed_dim, padding_idx=0)
-        nn.init.xavier_uniform_(self.item_emb.weight[1:])  # better init than default
+        nn.init.xavier_uniform_(self.item_emb.weight[1:])
 
         gru_input_dim = embed_dim
         if self.use_user_context:
@@ -545,7 +539,6 @@ class GRU4Rec(nn.Module):
             nn.init.xavier_uniform_(self.user_emb.weight[1:])
             gru_input_dim += embed_dim
 
-        # Single GRU layer — if num_layers=1, no inter-layer dropout, significantly faster
         self.gru = nn.GRU(
             input_size=gru_input_dim,
             hidden_size=hidden_dim,
@@ -555,31 +548,30 @@ class GRU4Rec(nn.Module):
         )
         self.dropout     = nn.Dropout(cfg["dropout"])
         self.output_proj = nn.Linear(hidden_dim, embed_dim, bias=False)
-        self.layer_norm  = nn.LayerNorm(embed_dim)  # stabilises training
+        self.layer_norm  = nn.LayerNorm(embed_dim)
 
     def encode_session(self, prefix_items: torch.Tensor, user_idxs: torch.Tensor) -> torch.Tensor:
-        x = self.item_emb(prefix_items)                    # (B, T, E)
+        x = self.item_emb(prefix_items)
 
         if self.use_user_context:
             u = self.user_emb(user_idxs).unsqueeze(1).expand(-1, x.size(1), -1)
             x = torch.cat([x, u], dim=-1)
 
-        # Lengths = number of non-padding tokens (sequence is left-padded)
         lengths = (prefix_items != 0).sum(dim=1).cpu().clamp(min=1)
 
         packed       = nn.utils.rnn.pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
         _, h_n       = self.gru(packed)
-        h_last       = self.dropout(h_n[-1])               # (B, H)
-        session_repr = self.layer_norm(self.output_proj(h_last))  # (B, E)
+        h_last       = self.dropout(h_n[-1])
+        session_repr = self.layer_norm(self.output_proj(h_last))
         return session_repr
 
     def forward(self, prefix_items, user_idxs, positive_items, negative_items):
-        session_repr = self.encode_session(prefix_items, user_idxs)  # (B, E)
-        pos_emb      = self.item_emb(positive_items)                  # (B, E)
-        neg_emb      = self.item_emb(negative_items)                  # (B, K, E)
+        session_repr = self.encode_session(prefix_items, user_idxs)
+        pos_emb      = self.item_emb(positive_items)
+        neg_emb      = self.item_emb(negative_items)
 
-        pos_scores = (session_repr * pos_emb).sum(dim=-1)             # (B,)
-        neg_scores = torch.bmm(neg_emb, session_repr.unsqueeze(-1)).squeeze(-1)  # (B, K)
+        pos_scores = (session_repr * pos_emb).sum(dim=-1)
+        neg_scores = torch.bmm(neg_emb, session_repr.unsqueeze(-1)).squeeze(-1)
         return pos_scores, neg_scores
 
     @torch.no_grad()
@@ -587,20 +579,19 @@ class GRU4Rec(nn.Module):
         self,
         prefix_items: torch.Tensor,
         user_idxs: torch.Tensor,
-        all_item_emb: torch.Tensor,   # (num_items, E)  — pre-fetched, excludes padding row
+        all_item_emb: torch.Tensor,
         top_n: int,
-        exclude_sets: list[set],      # one set per row — items to mask out
+        exclude_sets: list[set],
     ) -> list[list[int]]:
         """
         Batched top-N prediction. Returns list of predicted item index lists (1-based).
         """
-        session_repr = self.encode_session(prefix_items, user_idxs)  # (B, E)
-        scores       = session_repr @ all_item_emb.T                  # (B, num_items)
+        session_repr = self.encode_session(prefix_items, user_idxs)
+        scores       = session_repr @ all_item_emb.T
 
-        # Mask already-seen items (in-place)
         for b, excl in enumerate(exclude_sets):
             for item_idx in excl:
-                scores[b, item_idx - 1] = -1e9   # item2idx is 1-based → -1 for tensor index
+                scores[b, item_idx - 1] = -1e9
 
         top_indices = torch.topk(scores, top_n, dim=-1).indices.cpu().numpy()
         return [[int(i) + 1 for i in row] for row in top_indices]
@@ -665,7 +656,7 @@ def train_epoch(model, loader, optimizer, scaler, device, run_cfg: dict):
 
 
 # ============================================================
-# EVALUATION  — batched, uses pre-cached embedding matrix
+# EVALUATION  — batched, with serving speed tracking
 # ============================================================
 
 @torch.no_grad()
@@ -673,6 +664,12 @@ def evaluate(model, test_sequences: list, run_cfg: dict, device: torch.device) -
     """
     Batched evaluation. Pre-caches item embedding matrix once — much faster than
     re-running model.item_emb per prediction as in the original.
+
+    Serving speed is tracked per predict_top_n batch call using time.perf_counter
+    (high resolution; avoids OS scheduling noise better than time.time).
+    Latency is expressed per individual prediction step (batch_time / batch_size)
+    so that mean/p50/p95/p99 are directly comparable across different eval_batch_size
+    settings and match the per-query numbers from the KNN pipeline.
     """
     model.eval()
     top_n      = run_cfg["top_n"]
@@ -680,9 +677,9 @@ def evaluate(model, test_sequences: list, run_cfg: dict, device: torch.device) -
     raw_model  = model.module if isinstance(model, nn.DataParallel) else model
 
     # Pre-cache item embeddings (excludes padding row 0)
-    all_item_emb = raw_model.item_emb.weight[1:].to(device)  # (num_items, E)
+    all_item_emb = raw_model.item_emb.weight[1:].to(device)
 
-    # Flatten all evaluation steps into (prefix, user, next_item, remaining_set) tuples
+    # Flatten all evaluation steps
     eval_steps = []
     for seq in test_sequences:
         items = seq["item_idxs"]
@@ -692,7 +689,7 @@ def evaluate(model, test_sequences: list, run_cfg: dict, device: torch.device) -
                 items[:split],
                 user,
                 items[split],
-                set(items[split:]),   # session-level ground truth
+                set(items[split:]),
             ))
 
     strict_hits, strict_mrr   = 0, 0.0
@@ -700,9 +697,15 @@ def evaluate(model, test_sequences: list, run_cfg: dict, device: torch.device) -
     session_prec, session_rec = 0.0, 0.0
     all_recommended           = set()
 
-    # Process in batches
+    # Serving speed: per-prediction latency in milliseconds.
+    # Each batch call time is divided by the batch size so the unit is
+    # consistent with the KNN pipeline (ms per individual query).
+    predict_latencies_ms = []
+
+    t_eval_start = time.time()
+
     for start in tqdm(range(0, len(eval_steps), eval_bs), desc="Evaluating", leave=False):
-        chunk = eval_steps[start: start + eval_bs]
+        chunk   = eval_steps[start: start + eval_bs]
         max_len = max(len(c[0]) for c in chunk)
         B       = len(chunk)
 
@@ -713,21 +716,34 @@ def evaluate(model, test_sequences: list, run_cfg: dict, device: torch.device) -
             prefix_t[i, max_len - L:] = torch.tensor(prefix, dtype=torch.long)
             user_t[i]                 = user
 
-        exclude_sets = [set(c[0]) for c in chunk]   # mask prefix items
+        exclude_sets = [set(c[0]) for c in chunk]
+
+        # Time the predict_top_n call and record per-prediction latency.
+        # Synchronise CUDA before starting the timer so GPU work from the
+        # previous batch isn't counted in this one.
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        t_pred = time.perf_counter()
 
         predicted_batch = raw_model.predict_top_n(
             prefix_t, user_t, all_item_emb, top_n, exclude_sets
         )
 
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        batch_ms = (time.perf_counter() - t_pred) * 1000
+
+        # Amortise batch latency across individual predictions
+        per_pred_ms = batch_ms / B
+        predict_latencies_ms.extend([per_pred_ms] * B)
+
         for (_, _, next_item, remaining), predicted in zip(chunk, predicted_batch):
             all_recommended.update(predicted)
 
-            # Strict: exact next item
             if next_item in predicted:
                 strict_hits += 1
                 strict_mrr  += 1.0 / (predicted.index(next_item) + 1)
 
-            # Session: any item in the remaining session ground truth
             hit_positions = [i for i, p in enumerate(predicted) if p in remaining]
             if hit_positions:
                 session_hits += 1
@@ -737,8 +753,12 @@ def evaluate(model, test_sequences: list, run_cfg: dict, device: torch.device) -
             session_prec += n_rel / top_n
             session_rec  += n_rel / len(remaining) if remaining else 0.0
 
-    n = max(len(eval_steps), 1)
-    return {
+    elapsed = time.time() - t_eval_start
+    n       = max(len(eval_steps), 1)
+
+    lat = np.array(predict_latencies_ms) if predict_latencies_ms else np.array([0.0])
+
+    results = {
         "strict_HR":         strict_hits / n,
         "strict_MRR":        strict_mrr  / n,
         "session_HR":        session_hits / n,
@@ -747,7 +767,26 @@ def evaluate(model, test_sequences: list, run_cfg: dict, device: torch.device) -
         "session_recall":    session_rec  / n,
         "coverage":          len(all_recommended),
         "total_predictions": n,
+
+        # Serving speed — per individual prediction step
+        "latency_mean_ms":   float(np.mean(lat)),
+        "latency_p50_ms":    float(np.percentile(lat, 50)),
+        "latency_p95_ms":    float(np.percentile(lat, 95)),
+        "latency_p99_ms":    float(np.percentile(lat, 99)),
+        "latency_max_ms":    float(np.max(lat)),
+        "throughput_qps":    float(n / elapsed) if elapsed > 0 else 0.0,
     }
+
+    log.info(
+        f"  Serving speed:  mean={results['latency_mean_ms']:.3f}ms  "
+        f"p50={results['latency_p50_ms']:.3f}ms  "
+        f"p95={results['latency_p95_ms']:.3f}ms  "
+        f"p99={results['latency_p99_ms']:.3f}ms  "
+        f"max={results['latency_max_ms']:.3f}ms  "
+        f"QPS={results['throughput_qps']:.1f}"
+    )
+
+    return results
 
 
 # ============================================================
@@ -759,17 +798,6 @@ def prepare_data(cfg: dict) -> dict:
     key       = _cache_key(cfg)
     log.info(f"[cache] Config hash: {key}")
 
-    for stage, fn, args in [
-        ("sessions",  lambda: parse_sessions(find_idomaar_file(RELATIONS_DIR, "sessions"), cfg), ()),
-        ("dataframes", None, ()),
-        ("filtered",   None, ()),
-        ("vocabs",     None, ()),
-        ("sequences",  None, ()),
-        ("splits",     None, ()),
-    ]:
-        pass  # handled below with proper dependencies
-
-    # ── sessions ────────────────────────────────────────────
     sessions = _load_cache("sessions", key, cache_dir)
     if sessions is None:
         sessions = parse_sessions(find_idomaar_file(RELATIONS_DIR, "sessions"), cfg)
@@ -777,34 +805,29 @@ def prepare_data(cfg: dict) -> dict:
             raise RuntimeError("No sessions parsed!")
         _save_cache("sessions", key, sessions, cache_dir)
 
-    # ── dataframes ──────────────────────────────────────────
     dfs = _load_cache("dataframes", key, cache_dir)
     if dfs is None:
         dfs = sessions_to_dataframe(sessions, cfg)
         _save_cache("dataframes", key, dfs, cache_dir)
     session_df, interaction_df = dfs
 
-    # ── filtered ────────────────────────────────────────────
     filtered = _load_cache("filtered", key, cache_dir)
     if filtered is None:
         filtered = filter_data(session_df, interaction_df, cfg)
         _save_cache("filtered", key, filtered, cache_dir)
     session_df, interaction_df = filtered
 
-    # ── vocabs ──────────────────────────────────────────────
     vocabs = _load_cache("vocabs", key, cache_dir)
     if vocabs is None:
         vocabs = build_vocabs(interaction_df)
         _save_cache("vocabs", key, vocabs, cache_dir)
     item2idx, user2idx = vocabs
 
-    # ── sequences ───────────────────────────────────────────
     sequences = _load_cache("sequences", key, cache_dir)
     if sequences is None:
         sequences = build_sequences(interaction_df, item2idx, user2idx)
         _save_cache("sequences", key, sequences, cache_dir)
 
-    # ── splits ──────────────────────────────────────────────
     splits = _load_cache("splits", key, cache_dir)
     if splits is None:
         splits = temporal_split(session_df, sequences, cfg)
@@ -833,7 +856,6 @@ def run_training(run_cfg: dict, data: dict, env_info: dict, is_tuning: bool = Fa
 
     device = torch.device(run_cfg["device"])
 
-    # ---- Dataset & DataLoader ----
     train_dataset = SessionDataset(train_seqs, run_cfg["use_playratio_weight"])
     collate_fn    = make_collate_fn(num_items, run_cfg["num_negatives"])
     train_loader  = DataLoader(
@@ -846,7 +868,6 @@ def run_training(run_cfg: dict, data: dict, env_info: dict, is_tuning: bool = Fa
         persistent_workers=(run_cfg["num_workers"] > 0),
     )
 
-    # ---- Model ----
     model    = GRU4Rec(num_items, num_users, run_cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     log.info(f"Model parameters: {n_params:,}")
@@ -864,11 +885,11 @@ def run_training(run_cfg: dict, data: dict, env_info: dict, is_tuning: bool = Fa
         f"{'_tune' if is_tuning else ''}"
     )
 
-    best_session_hr  = 0.0
+    best_session_hr   = 0.0
     epochs_no_improve = 0
-    final_results    = {}
-    patience         = run_cfg.get("patience", 5)
-    eval_every       = run_cfg.get("eval_every_n_epochs", 5)
+    final_results     = {}
+    patience          = run_cfg.get("patience", 5)
+    eval_every        = run_cfg.get("eval_every_n_epochs", 5)
 
     with mlflow.start_run(run_name=run_name, nested=is_tuning) as run:
         mlflow.log_params({k: str(v) for k, v in run_cfg.items()})
@@ -919,7 +940,6 @@ def run_training(run_cfg: dict, data: dict, env_info: dict, is_tuning: bool = Fa
                     f"peak={gpu_mem['gpu_mem_peak_mb']:.0f}MB"
                 )
 
-            # ---- Evaluation ----
             if epoch % eval_every == 0 or epoch == run_cfg["epochs"]:
                 t_eval = time.time()
                 results = evaluate(model, test_seqs, run_cfg, device)
@@ -935,6 +955,14 @@ def run_training(run_cfg: dict, data: dict, env_info: dict, is_tuning: bool = Fa
                     f"session_recall{top_n}":    results["session_recall"],
                     "coverage":                   results["coverage"],
                     "eval_time_sec":              round(eval_time, 2),
+
+                    # Serving speed metrics
+                    "latency_mean_ms":            results["latency_mean_ms"],
+                    "latency_p50_ms":             results["latency_p50_ms"],
+                    "latency_p95_ms":             results["latency_p95_ms"],
+                    "latency_p99_ms":             results["latency_p99_ms"],
+                    "latency_max_ms":             results["latency_max_ms"],
+                    "throughput_qps":             results["throughput_qps"],
                 }, step=epoch)
 
                 if not is_tuning:
@@ -946,7 +974,7 @@ def run_training(run_cfg: dict, data: dict, env_info: dict, is_tuning: bool = Fa
                     )
 
                 if results["session_HR"] > best_session_hr:
-                    best_session_hr  = results["session_HR"]
+                    best_session_hr   = results["session_HR"]
                     epochs_no_improve = 0
                     if not is_tuning:
                         state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
@@ -1009,7 +1037,7 @@ def create_optuna_trial_config(trial, base_cfg: dict) -> dict:
     trial_cfg["use_user_context"]     = trial.suggest_categorical("use_user_context",     [True, False])
     trial_cfg["lr_step_size"]         = trial.suggest_int("lr_step_size", 3, 10)
     trial_cfg["lr_gamma"]             = trial.suggest_float("lr_gamma", 0.3, 0.8, step=0.1)
-    trial_cfg["epochs"]               = 10   # fixed shorter epochs during tuning
+    trial_cfg["epochs"]               = 10
     return trial_cfg
 
 
