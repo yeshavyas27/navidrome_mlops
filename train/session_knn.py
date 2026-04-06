@@ -447,6 +447,9 @@ def evaluate(model, test_sequences, cfg):
 
     Both are reported so you can compare against papers (strict) while also
     measuring what actually matters for a music player (session).
+
+    Serving speed is also tracked per prediction call (mean, p50, p95, p99, max,
+    and overall throughput in queries/sec) and included in the returned results dict.
     """
     top_n = cfg["top_n"]
     log.info(f"Evaluating on {len(test_sequences)} test sessions (top-{top_n})...")
@@ -465,13 +468,20 @@ def evaluate(model, test_sequences, cfg):
     total_predictions = 0
     all_recommended_items = set()
 
+    # Serving speed: per-call wall time in milliseconds (time.perf_counter for
+    # high resolution; avoids GIL / OS scheduling noise better than time.time)
+    predict_latencies_ms = []
+
     for session_id, full_sequence in test_sequences.items():
         for split_point in range(1, len(full_sequence)):
             prefix = full_sequence[:split_point]
             next_item = full_sequence[split_point]                  # strict ground truth
             remaining = set(full_sequence[split_point:])            # session ground truth
 
+            t_pred = time.perf_counter()
             predictions = model.predict(prefix, top_n=top_n)
+            predict_latencies_ms.append((time.perf_counter() - t_pred) * 1000)
+
             predicted_items = [item for item, _ in predictions]
             all_recommended_items.update(predicted_items)
             total_predictions += 1
@@ -502,6 +512,9 @@ def evaluate(model, test_sequences, cfg):
 
     n = total_predictions if total_predictions > 0 else 1  # avoid division by zero
 
+    # Latency percentiles (numpy operates on the full list in one pass)
+    lat = np.array(predict_latencies_ms) if predict_latencies_ms else np.array([0.0])
+
     results = {
         # Strict next-item metrics (for paper comparison)
         "strict_HR":          strict_hits / n,
@@ -512,6 +525,14 @@ def evaluate(model, test_sequences, cfg):
         "session_MRR":        session_mrr_sum / n,
         "session_precision":  session_precision_sum / n,
         "session_recall":     session_recall_sum / n,
+
+        # Serving speed — per predict() call
+        "latency_mean_ms":    float(np.mean(lat)),
+        "latency_p50_ms":     float(np.percentile(lat, 50)),
+        "latency_p95_ms":     float(np.percentile(lat, 95)),
+        "latency_p99_ms":     float(np.percentile(lat, 99)),
+        "latency_max_ms":     float(np.max(lat)),
+        "throughput_qps":     float(total_predictions / elapsed) if elapsed > 0 else 0.0,
 
         # General
         "coverage":           len(all_recommended_items),
@@ -527,6 +548,12 @@ def evaluate(model, test_sequences, cfg):
              f"P@{top_n}={results['session_precision']:.4f}  "
              f"R@{top_n}={results['session_recall']:.4f}")
     log.info(f"  Coverage: {results['coverage']} unique items recommended")
+    log.info(f"  Serving speed:  mean={results['latency_mean_ms']:.2f}ms  "
+             f"p50={results['latency_p50_ms']:.2f}ms  "
+             f"p95={results['latency_p95_ms']:.2f}ms  "
+             f"p99={results['latency_p99_ms']:.2f}ms  "
+             f"max={results['latency_max_ms']:.2f}ms  "
+             f"QPS={results['throughput_qps']:.1f}")
 
     return results
 
@@ -645,6 +672,14 @@ def main():
             f"session_precision_at_{top_n}": results["session_precision"],
             f"session_recall_at_{top_n}":    results["session_recall"],
 
+            # Serving speed
+            "latency_mean_ms":    results["latency_mean_ms"],
+            "latency_p50_ms":     results["latency_p50_ms"],
+            "latency_p95_ms":     results["latency_p95_ms"],
+            "latency_p99_ms":     results["latency_p99_ms"],
+            "latency_max_ms":     results["latency_max_ms"],
+            "throughput_qps":     results["throughput_qps"],
+
             # General
             "coverage": results["coverage"],
             "total_predictions": results["total_predictions"],
@@ -675,6 +710,14 @@ def main():
     log.info(f"    MRR@{top_n}:          {results['session_MRR']:.4f}")
     log.info(f"    Precision@{top_n}:    {results['session_precision']:.4f}")
     log.info(f"    Recall@{top_n}:       {results['session_recall']:.4f}")
+    log.info(f"")
+    log.info(f"  Serving speed:")
+    log.info(f"    mean latency:     {results['latency_mean_ms']:.2f} ms/query")
+    log.info(f"    p50 latency:      {results['latency_p50_ms']:.2f} ms")
+    log.info(f"    p95 latency:      {results['latency_p95_ms']:.2f} ms")
+    log.info(f"    p99 latency:      {results['latency_p99_ms']:.2f} ms")
+    log.info(f"    max latency:      {results['latency_max_ms']:.2f} ms")
+    log.info(f"    throughput:       {results['throughput_qps']:.1f} queries/sec")
     log.info(f"")
     log.info(f"  Coverage:           {results['coverage']}")
     log.info(f"  Fit time:           {fit_time:.1f}s")
