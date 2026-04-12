@@ -63,7 +63,4 @@ RUN chown -R appuser:appuser /home/appuser/work
 # 10. Switch to non-root user
 USER appuser
 
-ENV MLFLOW_TRACKING_URI="http://129.114.27.248:8000"
-
-# Start your python server — adjust the module/script as needed
-CMD ["python3", "-m", "train.server"]
+ENV MLFLOW_TRACKING_URI="http://129.114.25.55:8000"
