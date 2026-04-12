@@ -71,35 +71,35 @@ cfg = {
     "skip_ratio_threshold":  0.25,
 
     # ---- Model (smaller defaults — train ~4x faster) ----
-    "embedding_dim":         64,         # was 128
-    "hidden_dim":            128,        # was 256
+    "embedding_dim":         32,         # was 128
+    "hidden_dim":            64,        # was 256
     "num_layers":            1,          # was 2  (single layer = no inter-layer dropout overhead)
     "dropout":               0.2,        # was 0.3
 
     # ---- Training ----
-    "epochs":                20,
-    "batch_size":            2048,        
+    "epochs":                50,
+    "batch_size":            8192,        
     "lr":                    3e-3,
     "weight_decay":          1e-5,
     "num_negatives":         20,
     "use_playratio_weight":  True,
     "use_user_context":      False,      # adds params + slower; only enable if you have many users
-    "lr_step_size":          7,
+    "lr_step_size":          5,
     "lr_gamma":              0.5,
     "grad_accum_steps":      1,          # was 10 — only useful when batch is tiny
     "patience":              5,          # early stopping patience (epochs without improvement)
 
     # ---- Evaluation ----
     "top_n":                 20,
-    "eval_every_n_epochs":   5,          # evaluate every N epochs (was hardcoded to 5)
-    "eval_batch_size":       256,        # batch size for evaluation forward passes
+    "eval_every_n_epochs":   10,          # evaluate every N epochs (was hardcoded to 5)
+    "eval_batch_size":       2048,        # batch size for evaluation forward passes
 
     # ---- Temporal split ----
     "test_fraction":         0.2,
 
     # ---- Hardware ----
     "device":                "cuda" if torch.cuda.is_available() else "cpu",
-    "num_workers":           4,
+    "num_workers":           8,
 
     # ---- Cache ----
     "cache_dir":             ".cache_gru4rec",
@@ -109,7 +109,7 @@ cfg = {
     "study_name":            "gru4rec_tuning",
 
     # ---- MLflow ----
-    "mlflow_tracking_uri":   "http://129.114.27.248:8000",
+    "mlflow_tracking_uri":   "http://129.114.25.55:8000",
     "mlflow_experiment":     "30music-session-recommendation",
 }
 
