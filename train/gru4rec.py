@@ -1,28 +1,23 @@
 """
-GRU4Rec with Playratio Weighting — 30Music Dataset (Optimised)
-===============================================================
+GRU4Rec with In-Batch Sampled Softmax — 30Music Dataset
+========================================================
 
-Key changes from original:
-  - Smaller model defaults (64 embed / 128 hidden / 1 layer) — 4-5x fewer params
-  - Fixed cache helpers (_cache_key, _load_cache, _save_cache) that were missing
-  - Fixed device handling (no hardcoded cuda:0)
-  - Fixed padding direction bug in collate_fn (now consistently right-padded)
-  - Batched evaluation with pre-cached item embeddings — orders of magnitude faster
-  - Playratio weights normalised before use (prevents 10x loss spikes)
-  - Early stopping on session HR
-  - Negative sampling moved to collate_fn (batched, faster)
-  - Dead config keys removed
-  - Serving speed tracked per predict_top_n call (mean/p50/p95/p99/max/QPS)
+Major changes vs previous version:
+  - In-batch sampled softmax loss (replaces BPR-max + uniform negatives).
+    This is the single biggest fix: the other positives in the batch act
+    as popularity-weighted hard negatives, which is what GRU4Rec actually
+    needs to learn good rankings.
+  - Cross-entropy loss instead of BPR-max (better-behaved with in-batch negs)
+  - Right-padding (was effectively left-padding; wasted GRU compute)
+  - Embedding dropout (regularizes item reps, following sars_tutorial)
+  - Playratio weighting off by default (was likely hurting)
+  - Eval subsampling during training; full eval only at end
+  - Fewer epochs by default; early stopping more aggressive
+  - Lower default LR (stronger gradient signal from in-batch softmax)
 
 Requirements
 ------------
     pip install torch mlflow pandas numpy tqdm optuna psutil
-
-Run
----
-    # Single run:   cfg["mode"] = "single"
-    # Tuning:       cfg["mode"] = "tune"
-    python gru4rec_30music_optimised.py
 """
 
 import os
@@ -40,6 +35,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import mlflow
@@ -70,29 +66,31 @@ cfg = {
     "min_user_sessions":     3,
     "skip_ratio_threshold":  0.25,
 
-    # ---- Model (smaller defaults — train ~4x faster) ----
-    "embedding_dim":         32,         # was 128
-    "hidden_dim":            64,        # was 256
-    "num_layers":            1,          # was 2  (single layer = no inter-layer dropout overhead)
-    "dropout":               0.2,        # was 0.3
+    # ---- Model ----
+    "embedding_dim":         64,
+    "hidden_dim":            128,
+    "num_layers":            1,
+    "dropout":               0.2,
+    "embedding_dropout":     0.25,       # NEW: dropout on input embeddings
 
     # ---- Training ----
-    "epochs":                50,
-    "batch_size":            8192,        
-    "lr":                    3e-3,
+    "epochs":                25,         # reduced: converges faster with sampled softmax
+    "batch_size":            2048,       # reduced: in-batch negs already give ~B hard negs
+    "lr":                    1e-3,       # reduced: stronger signal from sampled softmax
     "weight_decay":          1e-5,
-    "num_negatives":         20,
-    "use_playratio_weight":  True,
-    "use_user_context":      False,      # adds params + slower; only enable if you have many users
+    "use_playratio_weight":  False,      # OFF: was likely hurting
+    "use_user_context":      False,
     "lr_step_size":          5,
     "lr_gamma":              0.5,
-    "grad_accum_steps":      1,          # was 10 — only useful when batch is tiny
-    "patience":              5,          # early stopping patience (epochs without improvement)
+    "patience":              3,          # more aggressive early stop
+    "label_smoothing":       0.0,
 
     # ---- Evaluation ----
     "top_n":                 20,
-    "eval_every_n_epochs":   10,          # evaluate every N epochs (was hardcoded to 5)
-    "eval_batch_size":       2048,        # batch size for evaluation forward passes
+    "eval_every_n_epochs":   2,
+    "eval_batch_size":       2048,
+    "max_eval_sessions":     5000,       # NEW: subsample for speed during training
+    "full_eval_at_end":      True,       # NEW: run full eval on final epoch
 
     # ---- Temporal split ----
     "test_fraction":         0.2,
@@ -104,7 +102,7 @@ cfg = {
     # ---- Cache ----
     "cache_dir":             ".cache_gru4rec",
 
-    # ---- Optuna (mode="tune" only) ----
+    # ---- Optuna ----
     "n_trials":              20,
     "study_name":            "gru4rec_tuning",
 
@@ -125,7 +123,6 @@ log = logging.getLogger(__name__)
 # ============================================================
 
 def _cache_key(cfg: dict) -> str:
-    """Stable hash over the preprocessing-relevant config keys."""
     relevant = {k: cfg[k] for k in (
         "sample_sessions", "min_session_length", "max_session_length",
         "min_item_support", "min_user_sessions", "skip_ratio_threshold",
@@ -153,7 +150,7 @@ def _save_cache(stage: str, key: str, data, cache_dir: str = ".cache_gru4rec"):
     path = _cache_path(stage, key, cache_dir)
     with open(path, "wb") as f:
         pickle.dump(data, f)
-    log.info(f"[cache] Saved {stage} → {path}")
+    log.info(f"[cache] Saved {stage} -> {path}")
 
 
 # ============================================================
@@ -463,9 +460,8 @@ def temporal_split(session_df, sequences: list, cfg: dict):
 
 class SessionDataset(Dataset):
     """
-    One sample = one (prefix → next_item) step within a session.
-    Negatives are sampled in collate_fn (batched) rather than per-item
-    to avoid repeated Python random calls in DataLoader workers.
+    One sample = one (prefix -> next_item) step within a session.
+    No negative sampling here anymore — in-batch negatives are used in the loss.
     """
     def __init__(self, sequences: list, use_playratio_weight: bool):
         self.samples              = []
@@ -492,31 +488,25 @@ class SessionDataset(Dataset):
         }
 
 
-def make_collate_fn(num_items: int, num_negatives: int):
+def collate_fn(batch):
     """
-    Returns a collate_fn that:
-      1. Left-pads sequences (consistent with pack_padded_sequence)
-      2. Samples negatives once per batch (faster than per-item)
+    Right-pads sequences. pack_padded_sequence handles variable lengths.
+    No negative sampling — handled in-batch by the loss.
     """
-    def collate_fn(batch):
-        max_len  = max(b["prefix"].size(0) for b in batch)
-        B        = len(batch)
+    max_len  = max(b["prefix"].size(0) for b in batch)
+    B        = len(batch)
 
-        prefixes = torch.zeros(B, max_len, dtype=torch.long)
-        for i, b in enumerate(batch):
-            L = b["prefix"].size(0)
-            prefixes[i, max_len - L:] = b["prefix"]
+    prefixes = torch.zeros(B, max_len, dtype=torch.long)
+    for i, b in enumerate(batch):
+        L = b["prefix"].size(0)
+        prefixes[i, :L] = b["prefix"]   # right-pad
 
-        negatives = torch.randint(1, num_items + 1, (B, num_negatives))
-
-        return {
-            "prefix":    prefixes,
-            "user":      torch.stack([b["user"]     for b in batch]),
-            "positive":  torch.stack([b["positive"] for b in batch]),
-            "negatives": negatives,
-            "weight":    torch.stack([b["weight"]   for b in batch]),
-        }
-    return collate_fn
+    return {
+        "prefix":    prefixes,
+        "user":      torch.stack([b["user"]     for b in batch]),
+        "positive":  torch.stack([b["positive"] for b in batch]),
+        "weight":    torch.stack([b["weight"]   for b in batch]),
+    }
 
 
 # ============================================================
@@ -530,8 +520,9 @@ class GRU4Rec(nn.Module):
         embed_dim             = cfg["embedding_dim"]
         hidden_dim            = cfg["hidden_dim"]
 
-        self.item_emb = nn.Embedding(num_items + 1, embed_dim, padding_idx=0)
+        self.item_emb     = nn.Embedding(num_items + 1, embed_dim, padding_idx=0)
         nn.init.xavier_uniform_(self.item_emb.weight[1:])
+        self.emb_dropout  = nn.Dropout(cfg.get("embedding_dropout", 0.0))
 
         gru_input_dim = embed_dim
         if self.use_user_context:
@@ -552,6 +543,7 @@ class GRU4Rec(nn.Module):
 
     def encode_session(self, prefix_items: torch.Tensor, user_idxs: torch.Tensor) -> torch.Tensor:
         x = self.item_emb(prefix_items)
+        x = self.emb_dropout(x)
 
         if self.use_user_context:
             u = self.user_emb(user_idxs).unsqueeze(1).expand(-1, x.size(1), -1)
@@ -565,14 +557,17 @@ class GRU4Rec(nn.Module):
         session_repr = self.layer_norm(self.output_proj(h_last))
         return session_repr
 
-    def forward(self, prefix_items, user_idxs, positive_items, negative_items):
-        session_repr = self.encode_session(prefix_items, user_idxs)
-        pos_emb      = self.item_emb(positive_items)
-        neg_emb      = self.item_emb(negative_items)
-
-        pos_scores = (session_repr * pos_emb).sum(dim=-1)
-        neg_scores = torch.bmm(neg_emb, session_repr.unsqueeze(-1)).squeeze(-1)
-        return pos_scores, neg_scores
+    def forward_inbatch(self, prefix_items, user_idxs, positive_items):
+        """
+        In-batch sampled softmax forward.
+        Returns logits (B, B) where diagonal is the positive score and
+        off-diagonal entries are scores against other positives in the batch
+        (which serve as popularity-weighted negatives).
+        """
+        session_repr = self.encode_session(prefix_items, user_idxs)   # (B, D)
+        pos_emb      = self.item_emb(positive_items)                  # (B, D)
+        logits       = session_repr @ pos_emb.T                       # (B, B)
+        return logits
 
     @torch.no_grad()
     def predict_top_n(
@@ -581,11 +576,8 @@ class GRU4Rec(nn.Module):
         user_idxs: torch.Tensor,
         all_item_emb: torch.Tensor,
         top_n: int,
-        exclude_sets: list[set],
-    ) -> list[list[int]]:
-        """
-        Batched top-N prediction. Returns list of predicted item index lists (1-based).
-        """
+        exclude_sets: list,
+    ) -> list:
         session_repr = self.encode_session(prefix_items, user_idxs)
         scores       = session_repr @ all_item_emb.T
 
@@ -598,17 +590,53 @@ class GRU4Rec(nn.Module):
 
 
 # ============================================================
-# LOSS
+# LOSS — in-batch sampled softmax with optional label smoothing
 # ============================================================
 
-def bpr_max_loss(pos_scores: torch.Tensor, neg_scores: torch.Tensor, weights=None) -> torch.Tensor:
-    """BPR-Max: push positive above softmax-weighted negatives."""
-    neg_softmax  = torch.softmax(neg_scores, dim=-1)
-    weighted_neg = (neg_softmax * neg_scores).sum(dim=-1)
-    bpr          = -torch.log(torch.sigmoid(pos_scores - weighted_neg) + 1e-8)
+def inbatch_softmax_loss(logits: torch.Tensor, weights=None, label_smoothing: float = 0.0) -> torch.Tensor:
+    """
+    Cross-entropy with the diagonal as the correct class.
+    logits: (B, B) — row i, col j = score of session_i against positive_j
+    """
+    B      = logits.size(0)
+    labels = torch.arange(B, device=logits.device)
+
+    # Mask out duplicate positives in the batch (if the same item appears as
+    # positive for multiple samples, we shouldn't treat it as a negative).
+    # This is cheap and avoids a known bug in naive in-batch softmax.
+    # We detect duplicates by comparing against labels — if logits[i, j] refers
+    # to the same item as logits[i, i], mask it. We approximate this by passing
+    # a mask from outside; here we just handle the simple case.
+    loss = F.cross_entropy(logits, labels, reduction="none", label_smoothing=label_smoothing)
     if weights is not None:
-        bpr = bpr * weights
-    return bpr.mean()
+        loss = loss * weights
+    return loss.mean()
+
+
+def inbatch_softmax_loss_masked(
+    logits: torch.Tensor,
+    positives: torch.Tensor,
+    weights=None,
+    label_smoothing: float = 0.0,
+) -> torch.Tensor:
+    """
+    Same as above but masks out off-diagonal entries where the 'negative'
+    item id equals the true positive id for that row. Prevents accidentally
+    pushing the correct item down.
+    """
+    B      = logits.size(0)
+    labels = torch.arange(B, device=logits.device)
+
+    # Build a mask: True where column j's item == row i's positive item and i != j
+    same   = positives.unsqueeze(0) == positives.unsqueeze(1)   # (B, B)
+    eye    = torch.eye(B, dtype=torch.bool, device=logits.device)
+    mask   = same & ~eye
+    logits = logits.masked_fill(mask, -1e9)
+
+    loss = F.cross_entropy(logits, labels, reduction="none", label_smoothing=label_smoothing)
+    if weights is not None:
+        loss = loss * weights
+    return loss.mean()
 
 
 # ============================================================
@@ -621,19 +649,19 @@ def train_epoch(model, loader, optimizer, scaler, device, run_cfg: dict):
     num_batches   = 0
     total_samples = 0
     use_amp       = (device.type == "cuda")
-
-    optimizer.zero_grad()
+    label_smooth  = run_cfg.get("label_smoothing", 0.0)
 
     for step, batch in enumerate(loader):
         prefix    = batch["prefix"].to(device, non_blocking=True)
         user      = batch["user"].to(device, non_blocking=True)
         positive  = batch["positive"].to(device, non_blocking=True)
-        negatives = batch["negatives"].to(device, non_blocking=True)
         weight    = batch["weight"].to(device, non_blocking=True) if run_cfg["use_playratio_weight"] else None
 
+        optimizer.zero_grad()
+
         with torch.cuda.amp.autocast(enabled=use_amp):
-            pos_scores, neg_scores = model(prefix, user, positive, negatives)
-            loss                   = bpr_max_loss(pos_scores, neg_scores, weight)
+            logits = model.forward_inbatch(prefix, user, positive)
+            loss   = inbatch_softmax_loss_masked(logits, positive, weight, label_smoothing=label_smooth)
 
         if use_amp:
             scaler.scale(loss).backward()
@@ -646,8 +674,6 @@ def train_epoch(model, loader, optimizer, scaler, device, run_cfg: dict):
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
 
-        optimizer.zero_grad()
-
         total_loss    += loss.item()
         num_batches   += 1
         total_samples += prefix.size(0)
@@ -656,30 +682,26 @@ def train_epoch(model, loader, optimizer, scaler, device, run_cfg: dict):
 
 
 # ============================================================
-# EVALUATION  — batched, with serving speed tracking
+# EVALUATION
 # ============================================================
 
 @torch.no_grad()
-def evaluate(model, test_sequences: list, run_cfg: dict, device: torch.device) -> dict:
+def evaluate(model, test_sequences: list, run_cfg: dict, device: torch.device,
+             max_sessions: int = None) -> dict:
     """
-    Batched evaluation. Pre-caches item embedding matrix once — much faster than
-    re-running model.item_emb per prediction as in the original.
-
-    Serving speed is tracked per predict_top_n batch call using time.perf_counter
-    (high resolution; avoids OS scheduling noise better than time.time).
-    Latency is expressed per individual prediction step (batch_time / batch_size)
-    so that mean/p50/p95/p99 are directly comparable across different eval_batch_size
-    settings and match the per-query numbers from the KNN pipeline.
+    Batched evaluation. If max_sessions is set, subsamples test sequences for speed.
     """
     model.eval()
     top_n      = run_cfg["top_n"]
-    eval_bs    = run_cfg.get("eval_batch_size", 256)
+    eval_bs    = run_cfg.get("eval_batch_size", 2048)
     raw_model  = model.module if isinstance(model, nn.DataParallel) else model
 
-    # Pre-cache item embeddings (excludes padding row 0)
+    if max_sessions is not None and len(test_sequences) > max_sessions:
+        rng       = random.Random(42)
+        test_sequences = rng.sample(test_sequences, max_sessions)
+
     all_item_emb = raw_model.item_emb.weight[1:].to(device)
 
-    # Flatten all evaluation steps
     eval_steps = []
     for seq in test_sequences:
         items = seq["item_idxs"]
@@ -696,11 +718,7 @@ def evaluate(model, test_sequences: list, run_cfg: dict, device: torch.device) -
     session_hits, session_mrr = 0, 0.0
     session_prec, session_rec = 0.0, 0.0
     all_recommended           = set()
-
-    # Serving speed: per-prediction latency in milliseconds.
-    # Each batch call time is divided by the batch size so the unit is
-    # consistent with the KNN pipeline (ms per individual query).
-    predict_latencies_ms = []
+    predict_latencies_ms      = []
 
     t_eval_start = time.time()
 
@@ -713,14 +731,11 @@ def evaluate(model, test_sequences: list, run_cfg: dict, device: torch.device) -
         user_t   = torch.zeros(B,          dtype=torch.long, device=device)
         for i, (prefix, user, _, _) in enumerate(chunk):
             L = len(prefix)
-            prefix_t[i, max_len - L:] = torch.tensor(prefix, dtype=torch.long)
-            user_t[i]                 = user
+            prefix_t[i, :L] = torch.tensor(prefix, dtype=torch.long)   # right-pad
+            user_t[i]       = user
 
         exclude_sets = [set(c[0]) for c in chunk]
 
-        # Time the predict_top_n call and record per-prediction latency.
-        # Synchronise CUDA before starting the timer so GPU work from the
-        # previous batch isn't counted in this one.
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         t_pred = time.perf_counter()
@@ -733,7 +748,6 @@ def evaluate(model, test_sequences: list, run_cfg: dict, device: torch.device) -
             torch.cuda.synchronize(device)
         batch_ms = (time.perf_counter() - t_pred) * 1000
 
-        # Amortise batch latency across individual predictions
         per_pred_ms = batch_ms / B
         predict_latencies_ms.extend([per_pred_ms] * B)
 
@@ -755,8 +769,7 @@ def evaluate(model, test_sequences: list, run_cfg: dict, device: torch.device) -
 
     elapsed = time.time() - t_eval_start
     n       = max(len(eval_steps), 1)
-
-    lat = np.array(predict_latencies_ms) if predict_latencies_ms else np.array([0.0])
+    lat     = np.array(predict_latencies_ms) if predict_latencies_ms else np.array([0.0])
 
     results = {
         "strict_HR":         strict_hits / n,
@@ -767,8 +780,6 @@ def evaluate(model, test_sequences: list, run_cfg: dict, device: torch.device) -
         "session_recall":    session_rec  / n,
         "coverage":          len(all_recommended),
         "total_predictions": n,
-
-        # Serving speed — per individual prediction step
         "latency_mean_ms":   float(np.mean(lat)),
         "latency_p50_ms":    float(np.percentile(lat, 50)),
         "latency_p95_ms":    float(np.percentile(lat, 95)),
@@ -845,7 +856,7 @@ def prepare_data(cfg: dict) -> dict:
 
 
 # ============================================================
-# SINGLE TRAINING RUN
+# TRAINING RUN
 # ============================================================
 
 def run_training(run_cfg: dict, data: dict, env_info: dict, is_tuning: bool = False) -> dict:
@@ -857,7 +868,6 @@ def run_training(run_cfg: dict, data: dict, env_info: dict, is_tuning: bool = Fa
     device = torch.device(run_cfg["device"])
 
     train_dataset = SessionDataset(train_seqs, run_cfg["use_playratio_weight"])
-    collate_fn    = make_collate_fn(num_items, run_cfg["num_negatives"])
     train_loader  = DataLoader(
         train_dataset,
         batch_size=run_cfg["batch_size"],
@@ -866,6 +876,7 @@ def run_training(run_cfg: dict, data: dict, env_info: dict, is_tuning: bool = Fa
         collate_fn=collate_fn,
         pin_memory=(device.type == "cuda"),
         persistent_workers=(run_cfg["num_workers"] > 0),
+        drop_last=True,   # important for in-batch softmax: avoid tiny final batch
     )
 
     model    = GRU4Rec(num_items, num_users, run_cfg).to(device)
@@ -880,7 +891,7 @@ def run_training(run_cfg: dict, data: dict, env_info: dict, is_tuning: bool = Fa
         torch.cuda.reset_peak_memory_stats()
 
     run_name = (
-        f"gru4rec_e{run_cfg['embedding_dim']}_h{run_cfg['hidden_dim']}_l{run_cfg['num_layers']}"
+        f"gru4rec_inbatch_e{run_cfg['embedding_dim']}_h{run_cfg['hidden_dim']}_l{run_cfg['num_layers']}"
         f"{'_ratio' if run_cfg['use_playratio_weight'] else ''}"
         f"{'_tune' if is_tuning else ''}"
     )
@@ -888,8 +899,9 @@ def run_training(run_cfg: dict, data: dict, env_info: dict, is_tuning: bool = Fa
     best_session_hr   = 0.0
     epochs_no_improve = 0
     final_results     = {}
-    patience          = run_cfg.get("patience", 5)
-    eval_every        = run_cfg.get("eval_every_n_epochs", 5)
+    patience          = run_cfg.get("patience", 3)
+    eval_every        = run_cfg.get("eval_every_n_epochs", 2)
+    max_eval          = run_cfg.get("max_eval_sessions", None)
 
     with mlflow.start_run(run_name=run_name, nested=is_tuning) as run:
         mlflow.log_params({k: str(v) for k, v in run_cfg.items()})
@@ -900,9 +912,10 @@ def run_training(run_cfg: dict, data: dict, env_info: dict, is_tuning: bool = Fa
             "test_sessions":    len(test_seqs),
             "train_samples":    len(train_dataset),
             "model_parameters": n_params,
+            "loss_type":        "inbatch_sampled_softmax",
         })
         mlflow.set_tags({
-            "model_type":   "GRU4Rec",
+            "model_type":   "GRU4Rec-InBatch",
             "dataset":      "30Music",
             "tuning_trial": str(is_tuning),
         })
@@ -940,29 +953,30 @@ def run_training(run_cfg: dict, data: dict, env_info: dict, is_tuning: bool = Fa
                     f"peak={gpu_mem['gpu_mem_peak_mb']:.0f}MB"
                 )
 
-            if epoch % eval_every == 0 or epoch == run_cfg["epochs"]:
+            is_last = (epoch == run_cfg["epochs"])
+            if epoch % eval_every == 0 or is_last:
                 t_eval = time.time()
-                results = evaluate(model, test_seqs, run_cfg, device)
+                # Use subsampled eval except on last epoch (if configured)
+                eval_limit = None if (is_last and run_cfg.get("full_eval_at_end", True)) else max_eval
+                results = evaluate(model, test_seqs, run_cfg, device, max_sessions=eval_limit)
                 eval_time = time.time() - t_eval
 
                 top_n = run_cfg["top_n"]
                 mlflow.log_metrics({
-                    f"strict_HR{top_n}":        results["strict_HR"],
-                    f"strict_MRR{top_n}":       results["strict_MRR"],
+                    f"strict_HR{top_n}":         results["strict_HR"],
+                    f"strict_MRR{top_n}":        results["strict_MRR"],
                     f"session_HR{top_n}":        results["session_HR"],
                     f"session_MRR{top_n}":       results["session_MRR"],
                     f"session_precision{top_n}": results["session_precision"],
                     f"session_recall{top_n}":    results["session_recall"],
-                    "coverage":                   results["coverage"],
-                    "eval_time_sec":              round(eval_time, 2),
-
-                    # Serving speed metrics
-                    "latency_mean_ms":            results["latency_mean_ms"],
-                    "latency_p50_ms":             results["latency_p50_ms"],
-                    "latency_p95_ms":             results["latency_p95_ms"],
-                    "latency_p99_ms":             results["latency_p99_ms"],
-                    "latency_max_ms":             results["latency_max_ms"],
-                    "throughput_qps":             results["throughput_qps"],
+                    "coverage":                  results["coverage"],
+                    "eval_time_sec":             round(eval_time, 2),
+                    "latency_mean_ms":           results["latency_mean_ms"],
+                    "latency_p50_ms":            results["latency_p50_ms"],
+                    "latency_p95_ms":            results["latency_p95_ms"],
+                    "latency_p99_ms":            results["latency_p99_ms"],
+                    "latency_max_ms":            results["latency_max_ms"],
+                    "throughput_qps":            results["throughput_qps"],
                 }, step=epoch)
 
                 if not is_tuning:
@@ -970,7 +984,7 @@ def run_training(run_cfg: dict, data: dict, env_info: dict, is_tuning: bool = Fa
                         f"  Strict  HR{top_n}={results['strict_HR']:.4f}  MRR={results['strict_MRR']:.4f}\n"
                         f"  Session HR{top_n}={results['session_HR']:.4f}  MRR={results['session_MRR']:.4f}  "
                         f"P={results['session_precision']:.4f}  R={results['session_recall']:.4f}\n"
-                        f"  Eval: {eval_time:.1f}s"
+                        f"  Eval: {eval_time:.1f}s  (subsampled={eval_limit is not None})"
                     )
 
                 if results["session_HR"] > best_session_hr:
@@ -979,7 +993,7 @@ def run_training(run_cfg: dict, data: dict, env_info: dict, is_tuning: bool = Fa
                     if not is_tuning:
                         state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
                         torch.save(state, "best_gru4rec.pt")
-                        log.info(f"  → New best session HR{top_n}: {best_session_hr:.4f} (saved)")
+                        log.info(f"  -> New best session HR{top_n}: {best_session_hr:.4f} (saved)")
                 else:
                     epochs_no_improve += 1
                     if epochs_no_improve >= patience:
@@ -1025,19 +1039,19 @@ def run_training(run_cfg: dict, data: dict, env_info: dict, is_tuning: bool = Fa
 
 def create_optuna_trial_config(trial, base_cfg: dict) -> dict:
     trial_cfg = base_cfg.copy()
-    trial_cfg["embedding_dim"]        = trial.suggest_categorical("embedding_dim",  [32, 64, 128])
-    trial_cfg["hidden_dim"]           = trial.suggest_categorical("hidden_dim",     [64, 128, 256])
-    trial_cfg["num_layers"]           = trial.suggest_int("num_layers", 1, 2)
-    trial_cfg["dropout"]              = trial.suggest_float("dropout",  0.1, 0.5, step=0.1)
-    trial_cfg["lr"]                   = trial.suggest_float("lr",       1e-4, 5e-3, log=True)
-    trial_cfg["weight_decay"]         = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
-    trial_cfg["batch_size"]           = trial.suggest_categorical("batch_size",    [256, 512, 1024])
-    trial_cfg["num_negatives"]        = trial.suggest_categorical("num_negatives", [10, 20, 50])
-    trial_cfg["use_playratio_weight"] = trial.suggest_categorical("use_playratio_weight", [True, False])
-    trial_cfg["use_user_context"]     = trial.suggest_categorical("use_user_context",     [True, False])
-    trial_cfg["lr_step_size"]         = trial.suggest_int("lr_step_size", 3, 10)
-    trial_cfg["lr_gamma"]             = trial.suggest_float("lr_gamma", 0.3, 0.8, step=0.1)
-    trial_cfg["epochs"]               = 10
+    trial_cfg["embedding_dim"]     = trial.suggest_categorical("embedding_dim",  [32, 64, 128])
+    trial_cfg["hidden_dim"]        = trial.suggest_categorical("hidden_dim",     [64, 128, 256])
+    trial_cfg["num_layers"]        = trial.suggest_int("num_layers", 1, 2)
+    trial_cfg["dropout"]           = trial.suggest_float("dropout",  0.1, 0.5, step=0.1)
+    trial_cfg["embedding_dropout"] = trial.suggest_float("embedding_dropout", 0.0, 0.4, step=0.1)
+    trial_cfg["lr"]                = trial.suggest_float("lr",       1e-4, 3e-3, log=True)
+    trial_cfg["weight_decay"]      = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
+    trial_cfg["batch_size"]        = trial.suggest_categorical("batch_size",    [512, 1024, 2048, 4096])
+    trial_cfg["label_smoothing"]   = trial.suggest_float("label_smoothing", 0.0, 0.1, step=0.05)
+    trial_cfg["lr_step_size"]      = trial.suggest_int("lr_step_size", 3, 10)
+    trial_cfg["lr_gamma"]          = trial.suggest_float("lr_gamma", 0.3, 0.8, step=0.1)
+    trial_cfg["epochs"]            = 10
+    trial_cfg["max_eval_sessions"] = 3000   # faster tuning
     return trial_cfg
 
 
