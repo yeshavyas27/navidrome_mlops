@@ -583,7 +583,7 @@ class GRU4Rec(nn.Module):
 
         for b, excl in enumerate(exclude_sets):
             for item_idx in excl:
-                scores[b, item_idx - 1] = -1e9
+                scores[b, item_idx - 1] = float("-inf")
 
         top_indices = torch.topk(scores, top_n, dim=-1).indices.cpu().numpy()
         return [[int(i) + 1 for i in row] for row in top_indices]
@@ -631,7 +631,7 @@ def inbatch_softmax_loss_masked(
     same   = positives.unsqueeze(0) == positives.unsqueeze(1)   # (B, B)
     eye    = torch.eye(B, dtype=torch.bool, device=logits.device)
     mask   = same & ~eye
-    logits = logits.masked_fill(mask, -1e9)
+    logits = logits.masked_fill(mask, float("-inf"))
 
     loss = F.cross_entropy(logits, labels, reduction="none", label_smoothing=label_smoothing)
     if weights is not None:
