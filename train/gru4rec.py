@@ -74,7 +74,7 @@ cfg = {
     "embedding_dropout":     0.25,       # NEW: dropout on input embeddings
 
     # ---- Training ----
-    "epochs":                25,         # reduced: converges faster with sampled softmax
+    "epochs":                200,         # reduced: converges faster with sampled softmax
     "batch_size":            2048,       # reduced: in-batch negs already give ~B hard negs
     "lr":                    1e-3,       # reduced: stronger signal from sampled softmax
     "weight_decay":          1e-5,
@@ -87,7 +87,7 @@ cfg = {
 
     # ---- Evaluation ----
     "top_n":                 20,
-    "eval_every_n_epochs":   2,
+    "eval_every_n_epochs":   20,
     "eval_batch_size":       2048,
     "max_eval_sessions":     5000,       # NEW: subsample for speed during training
     "full_eval_at_end":      True,       # NEW: run full eval on final epoch
