@@ -107,7 +107,7 @@ cfg = {
     "study_name":            "gru4rec_tuning",
 
     # ---- MLflow ----
-    "mlflow_tracking_uri":   "http://129.114.25.55:8000",
+    "mlflow_tracking_uri":   "http://129.114.25.168:8000",
     "mlflow_experiment":     "30music-session-recommendation",
 }
 
