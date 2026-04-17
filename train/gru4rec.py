@@ -74,7 +74,7 @@ cfg = {
     "embedding_dropout":     0.25,       # NEW: dropout on input embeddings
 
     # ---- Training ----
-    "epochs":                200,         # reduced: converges faster with sampled softmax
+    "epochs":                30,         # reduced: converges faster with sampled softmax
     "batch_size":            2048,       # reduced: in-batch negs already give ~B hard negs
     "lr":                    1e-3,       # reduced: stronger signal from sampled softmax
     "weight_decay":          1e-5,
