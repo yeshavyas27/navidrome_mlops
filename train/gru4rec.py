@@ -993,6 +993,7 @@ def run_training(run_cfg: dict, data: dict, env_info: dict, is_tuning: bool = Fa
                     if not is_tuning:
                         state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
                         torch.save(state, "best_gru4rec.pt")
+                        mlflow.log_artifact("best_gru4rec.pt")
                         log.info(f"  -> New best session HR{top_n}: {best_session_hr:.4f} (saved)")
                 else:
                     epochs_no_improve += 1
