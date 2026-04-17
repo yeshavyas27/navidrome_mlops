@@ -1,29 +1,10 @@
-FROM ubuntu:22.04
+FROM rocm/pytorch:rocm7.0_ubuntu22.04_py3.10_pytorch_release_2.4.0
 
-ARG ROCM_VERSION=7.0.1
-ARG AMDGPU_VERSION=7.0.1.70001
 ARG DEBIAN_FRONTEND=noninteractive
 
-# 1. Install Python (Ubuntu's apt cache is pre-populated in the image, skip update)
-RUN apt-get install -y --no-install-recommends \
-    python3 \
-    python3-pip \
-    wget \
-    && rm -rf /var/lib/apt/lists/*
-
-# 2. ROCm - bypass SHA1 key rejection, skip DKMS kernel modules
-RUN wget https://repo.radeon.com/amdgpu-install/$ROCM_VERSION/ubuntu/jammy/amdgpu-install_$AMDGPU_VERSION-1_all.deb \
-    && apt-get update --allow-insecure-repositories \
-    && apt-get install -y --allow-unauthenticated ./amdgpu-install_$AMDGPU_VERSION-1_all.deb \
-    && amdgpu-install --usecase=rocm --no-dkms -y --accept-eula \
-    && rm *.deb \
-    && rm -rf /var/lib/apt/lists/*
-
-# 3. PyTorch ROCm only
-RUN python3 -m pip install --no-cache-dir --index-url https://download.pytorch.org/whl/rocm7.0 torch
-
-# 4. Training deps
-RUN python3 -m pip install --no-cache-dir \
+# All of ROCm + PyTorch + Python 3.10 already in base image
+# Just install your pip deps
+RUN pip install --no-cache-dir \
     mlflow \
     pandas \
     numpy \
@@ -31,7 +12,7 @@ RUN python3 -m pip install --no-cache-dir \
     optuna \
     psutil
 
-# 5. Non-root user
+# Non-root user
 RUN useradd -m -s /bin/bash appuser
 WORKDIR /home/appuser/work
 COPY train/ ./train/
