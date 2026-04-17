@@ -1,8 +1,8 @@
-FROM rocm/pytorch:rocm7.0_ubuntu22.04_py3.10_pytorch_release_2.4.0
+FROM rocm/pytorch:rocm7.0_ubuntu22.04_py3.10_pytorch_release_2.8.0_rc1
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-# All of ROCm + PyTorch + Python 3.10 already in base image
+# ROCm + PyTorch + Python 3.10 already in base image
 # Just install your pip deps
 RUN pip install --no-cache-dir \
     mlflow \
