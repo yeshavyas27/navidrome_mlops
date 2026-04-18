@@ -47,6 +47,12 @@ try:
 except ImportError:
     OPTUNA_AVAILABLE = False
 
+try:
+    from minio_store import push_run_artifacts
+    MINIO_AVAILABLE = True
+except ImportError:
+    MINIO_AVAILABLE = False
+
 # ============================================================
 # CONFIGURATION
 # ============================================================
@@ -898,6 +904,8 @@ def run_training(run_cfg: dict, data: dict, env_info: dict, is_tuning: bool = Fa
     )
 
     best_session_hr   = 0.0
+    best_state_dict   = None   # kept in memory; pushed to MinIO at end
+    best_results      = {}
     epochs_no_improve = 0
     final_results     = {}
     patience          = run_cfg.get("patience", 3)
@@ -990,12 +998,51 @@ def run_training(run_cfg: dict, data: dict, env_info: dict, is_tuning: bool = Fa
 
                 if results["session_HR"] > best_session_hr:
                     best_session_hr   = results["session_HR"]
+                    best_results      = results
                     epochs_no_improve = 0
                     if not is_tuning:
                         state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
-                        torch.save(state, "best_gru4rec.pt")
-                        mlflow.log_artifact("best_gru4rec.pt")
-                        log.info(f"  -> New best session HR{top_n}: {best_session_hr:.4f} (saved)")
+                        best_state_dict = {k: v.cpu().clone() for k, v in state.items()}
+                        log.info(f"  -> New best session HR{top_n}: {best_session_hr:.4f}")
+
+                        if MINIO_AVAILABLE:
+                            from datetime import datetime, timezone
+                            _meta = {
+                                "run_type":      "pretrain",
+                                "mlflow_run_id": run.info.run_id,
+                                "timestamp":     datetime.now(timezone.utc).isoformat(),
+                                "session_HR":    round(best_session_hr, 6),
+                                "session_MRR":   round(results.get("session_MRR", 0), 6),
+                                "strict_HR":     round(results.get("strict_HR", 0), 6),
+                                "num_items":     data["num_items"],
+                                "embedding_dim": run_cfg["embedding_dim"],
+                                "hidden_dim":    run_cfg["hidden_dim"],
+                                "num_layers":    run_cfg["num_layers"],
+                                "epoch":         epoch,
+                                "gpu_name":      env_info.get("gpu_name", ""),
+                                "git_sha":       env_info.get("git_sha", ""),
+                            }
+                            _vocab = {
+                                "item2idx": data["item2idx"],
+                                "user2idx": data["user2idx"],
+                            }
+                            try:
+                                _keys = push_run_artifacts(
+                                    state_dict=best_state_dict,
+                                    run_type="pretrain",
+                                    run_id=run.info.run_id,
+                                    metadata=_meta,
+                                    vocab=_vocab,
+                                )
+                                mlflow.set_tags({
+                                    "minio_model_key":    _keys["model_key"],
+                                    "minio_vocab_key":    _keys.get("vocab_key", ""),
+                                    "minio_metadata_key": _keys["metadata_key"],
+                                })
+                                log.info(f"  [minio] model    → {_keys['model_key']}")
+                                log.info(f"  [minio] vocab    → {_keys.get('vocab_key', '')}")
+                            except Exception as _e:
+                                log.warning(f"  [minio] Upload skipped — {_e}")
                 else:
                     epochs_no_improve += 1
                     if epochs_no_improve >= patience:

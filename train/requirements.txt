@@ -7,3 +7,4 @@ tqdm
 optuna
 psutil
 gdown
+boto3

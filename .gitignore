@@ -36,6 +36,11 @@ AGENTS.md
 *.test
 *.wasm
 *.ndp
+# ML model weights — store in MinIO, not git
+*.pt
+*.pkl
+.cache_gru4rec/
+.env
 openspec/
 go.work*
 .worktrees/

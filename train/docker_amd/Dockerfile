@@ -57,4 +57,8 @@ RUN chown -R appuser:appuser /home/appuser/work
 
 USER appuser
 
-ENV MLFLOW_TRACKING_URI="http://129.114.25.55:8000"
+ENV MLFLOW_TRACKING_URI="http://129.114.27.204:8000"
+ENV MINIO_URL="http://minio.navidrome-platform.svc.cluster.local:9000"
+ENV MINIO_BUCKET="gru4rec-models"
+# MINIO_USER and MINIO_PASSWORD are passed at runtime — never baked into the image:
+# docker run --env-file .env ...  OR  docker run -e MINIO_USER=... -e MINIO_PASSWORD=... ...
