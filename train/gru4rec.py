@@ -844,7 +844,8 @@ def prepare_data(cfg: dict) -> dict:
         splits = temporal_split(session_df, sequences, cfg)
         _save_cache("splits", key, splits, cache_dir)
     train_seqs, test_seqs = splits
-    # need this output from data member - hashir
+
+    # expect this output from the data member - HASHIRRRRR
     return {
         "item2idx":   item2idx,
         "user2idx":   user2idx,
