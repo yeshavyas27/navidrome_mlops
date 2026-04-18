@@ -7,7 +7,6 @@ ThirtyMusic.tar.gz
 /iTunes*.xml
 /tmp
 /bin
-data/*
 vendor/*/
 wiki
 TODO.md
