@@ -1,73 +1,60 @@
-# Use a Jupyter base notebook pinned to Ubuntu 22.04 (Jammy) 
-# to ensure compatibility with the AMD ROCm repository
-FROM quay.io/jupyter/base-notebook:ubuntu-22.04
-
-# Define ROCm arguments from your reference
+FROM ubuntu:22.04
 ARG ROCM_VERSION=7.0.1
 ARG AMDGPU_VERSION=7.0.1.70001
+ARG DEBIAN_FRONTEND=noninteractive
 
-USER root
+# Apt retry/timeout config to reduce transient network failures
+RUN echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries && \
+    echo 'Acquire::http::Timeout "120";' >> /etc/apt/apt.conf.d/80-retries
 
-# 1. Install system prerequisites
+# 1. System prerequisites
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    tar \
-    gzip \
-    wget \
-    gnupg \
-    build-essential \
-    cmake \
-    libncurses-dev \
-    libsystemd-dev \
-    libudev-dev \
-    libdrm-dev \
-    git \
-    python3-pip \
+    tar gzip wget gnupg build-essential cmake \
+    libncurses-dev libsystemd-dev libudev-dev libdrm-dev git \
+    python3 python3-pip python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Install AMD ROCm system stack (from your reference)
+# 2a. Register ROCm installer (cached separately from the heavy install below)
 RUN wget https://repo.radeon.com/amdgpu-install/$ROCM_VERSION/ubuntu/jammy/amdgpu-install_$AMDGPU_VERSION-1_all.deb && \
     apt-get update --yes && \
-    apt-get install --yes ./amdgpu-install_$AMDGPU_VERSION-1_all.deb && \
-    amdgpu-install --usecase=rocm -y && \
-    rm *.deb
+    apt-get install --yes ./amdgpu-install_$AMDGPU_VERSION-1_all.deb
 
-# 3. Build nvtop from source with AMD support for monitoring
+# 2b. Run the actual ROCm install (separate layer — retries don't re-download .deb)
+RUN amdgpu-install --usecase=rocm -y && rm *.deb
+
+# 3. nvtop from source with AMD support
 RUN git clone https://github.com/Syllo/nvtop && \
     mkdir -p nvtop/build && cd nvtop/build && \
     cmake -DAMDGPU_SUPPORT=ON -DNVIDIA_SUPPORT=OFF .. && \
     make && make install && \
     cd ../.. && rm -rf nvtop
 
-# 4. Install PyTorch with ROCm (AMD) compatibility and Lightning
-RUN python3 -m pip install --no-cache-dir --index-url https://download.pytorch.org/whl/rocm7.0 \
-    'torch' \
-    'torchaudio' \
-    'torchvision'
+ENV PATH="/opt/rocm/bin/:$PATH"
+ENV NCCL_P2P_DISABLE=1
 
-RUN python3 -m pip install --no-cache-dir 'lightning'
+# 4. PyTorch with ROCm (--pre matches the ideal for latest compatible wheels)
+RUN python3 -m pip install --pre --no-cache-dir \
+    --index-url https://download.pytorch.org/whl/rocm7.0 \
+    'torch' 'torchaudio' 'torchvision'
 
-# 5. Define the working directory inside the container
-WORKDIR /home/${NB_USER}/work
+RUN python3 -m pip install --pre --no-cache-dir lightning
 
-# 6. Copy your entire repository context
+# 5. ROCm GPU monitoring libs (keep separate from project deps)
+RUN python3 -m pip install --pre --no-cache-dir pyrsmi amdsmi
+
+# 6. Non-root user
+RUN useradd -m -s /bin/bash appuser
+
+WORKDIR /home/appuser/work
+
 COPY . .
 
-# 7. Install your project's Python dependencies
+# 7. Project dependencies
 RUN python3 -m pip install --no-cache-dir --upgrade pip wheel setuptools && \
-    python3 -m pip install --no-cache-dir -r train/requirements.txt && \
-    python3 -m pip install --no-cache-dir bash_kernel && \
-    python3 -m bash_kernel.install --sys-prefix
+    python3 -m pip install --no-cache-dir -r train/requirements.txt
 
-# 8. CRITICAL: Fix permissions as ROOT before switching users
-RUN chown -R ${NB_UID}:${NB_GID} /home/${NB_USER}/work && \
-    fix-permissions "${CONDA_DIR}" && \
-    fix-permissions "/home/${NB_USER}"
+RUN chown -R appuser:appuser /home/appuser/work
 
-# 9. Switch to the non-root user for security and Jupyter standards
-USER ${NB_UID}
+USER appuser
 
-# Set the MLflow Tracking URI
-ENV MLFLOW_TRACKING_URI="http://129.114.27.248:8000"
-
-# Default command to start Jupyter
-CMD ["start-notebook.sh", "--NotebookApp.token=''"]
+ENV MLFLOW_TRACKING_URI="http://129.114.25.55:8000"
