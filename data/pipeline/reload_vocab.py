@@ -47,14 +47,16 @@ def find_latest_vocab(s3):
     return latest["Key"]
 
 def load_vocab_from_minio(s3, vocab_key):
-    """Download and unpickle vocab from MinIO."""
+    """Download and unpickle vocab from MinIO. Returns item2idx dict."""
     log.info(f"Downloading {vocab_key}...")
     buf = io.BytesIO()
     s3.download_fileobj(MINIO_BUCKET, vocab_key, buf)
     buf.seek(0)
     vocab = pickle.load(buf)
-    log.info(f"Loaded vocab: {len(vocab):,} items")
-    return vocab
+    # vocab is saved as {"item2idx": {...}, "user2idx": {...}}
+    item2idx = vocab["item2idx"] if isinstance(vocab, dict) and "item2idx" in vocab else vocab
+    log.info(f"Loaded vocab: {len(item2idx):,} items")
+    return item2idx
 
 def reload_redis(item2idx, version_key):
     """Push item2idx into Redis replacing old vocab."""

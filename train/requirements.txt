@@ -8,3 +8,4 @@ optuna
 psutil
 gdown
 boto3
+redis
