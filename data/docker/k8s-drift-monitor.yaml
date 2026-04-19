@@ -1,0 +1,37 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: drift-monitor-proj05
+  namespace: navidrome-platform
+spec:
+  schedule: "0 * * * *"   # every hour
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: drift-monitor
+            image: python:3.10-slim
+            command: ["/bin/sh", "-c"]
+            args:
+              - "pip install pandas pyarrow mlflow numpy python-swiftclient requests -q &&
+                 python /app/monitor_drift.py"
+            env:
+            - name: MLFLOW_TRACKING_URI
+              value: "http://mlflow.navidrome-platform.svc.cluster.local:8000"
+            - name: DATASET_VERSION
+              value: "v20260418-001"
+            - name: OS_AUTH_URL
+              value: "https://chi.uc.chameleoncloud.org:5000/v3"
+            - name: OS_APPLICATION_CREDENTIAL_ID
+              value: "648ff7bbd6644376bae2177818acc3fb"
+            - name: OS_APPLICATION_CREDENTIAL_SECRET
+              value: "21CQ_fWzYJF-sY1OMzkNt8zWmNBAfyrv3QmNH0qh67PeS2EYw5YaW8blTBcZO7mq8Mg3l2CrgiEo86EJHVXxaQ"
+            volumeMounts:
+            - name: monitor-code
+              mountPath: /app
+          volumes:
+          - name: monitor-code
+            configMap:
+              name: drift-monitor-code-proj05
+          restartPolicy: OnFailure

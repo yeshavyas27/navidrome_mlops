@@ -1,0 +1,7 @@
+requests
+pandas
+pyarrow
+fastapi
+uvicorn
+python-swiftclient
+numpy
