@@ -70,15 +70,23 @@ def get_swift_conn():
     )
 
 def swift_upload(local, name):
-    conn = get_swift_conn()
-    with open(local, "rb") as f:
-        conn.put_object(CONTAINER, name, f)
-    log.info(f"  uploaded -> {name} ({os.path.getsize(local)/1e6:.1f} MB)")
+    try:
+        conn = get_swift_conn()
+        with open(local, "rb") as f:
+            conn.put_object(CONTAINER, name, f)
+        log.info(f"  uploaded -> {name} ({os.path.getsize(local)/1e6:.1f} MB)")
+    except Exception as e:
+        log.error(f"  UPLOAD FAILED {name}: {e}")
+        raise
 
 def swift_upload_bytes(data, name):
-    conn = get_swift_conn()
-    conn.put_object(CONTAINER, name, data)
-    log.info(f"  uploaded -> {name}")
+    try:
+        conn = get_swift_conn()
+        conn.put_object(CONTAINER, name, data)
+        log.info(f"  uploaded -> {name}")
+    except Exception as e:
+        log.error(f"  UPLOAD FAILED {name}: {e}")
+        raise
 
 def list_objects(prefix):
     conn = get_swift_conn()
