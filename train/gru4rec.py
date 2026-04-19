@@ -1119,7 +1119,16 @@ def main():
         results = run_training(run_cfg=cfg, data=data, env_info=env_info, is_tuning=False)
         log.info(f"Final best session HR{cfg['top_n']}: {results['best_session_HR']:.4f}")
 
-    log.info(f"MLflow UI: {cfg['mlflow_tracking_uri']}")
+    log.info(f"MLflow UI: {cfg["mlflow_tracking_uri"]}")
+
+    # reload Redis vocab with latest trained vocab
+    try:
+        import subprocess
+        log.info("Reloading Redis vocab from MinIO...")
+        subprocess.run(["python3", "data/pipeline/reload_vocab.py", "--latest"], check=True)
+        log.info("Redis vocab reloaded successfully")
+    except Exception as e:
+        log.warning(f"Redis vocab reload failed (non-fatal): {e}")
 
 
 if __name__ == "__main__":
