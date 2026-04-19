@@ -9,3 +9,4 @@ psutil
 gdown
 boto3
 redis
+requests
