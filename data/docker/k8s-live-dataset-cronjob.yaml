@@ -1,0 +1,43 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: live-dataset-builder-proj05
+  namespace: navidrome-platform
+spec:
+  schedule: "0 2 * * *"   # runs every day at 2am UTC
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: live-dataset-builder
+            image: python:3.10-slim
+            command: ["/bin/sh", "-c"]
+            args:
+              - "pip install pandas pyarrow psycopg2-binary mlflow numpy python-swiftclient requests -q &&
+                 python /app/build_dataset_live.py"
+            env:
+            - name: PG_HOST
+              value: "postgres.navidrome-platform.svc.cluster.local"
+            - name: PG_DB
+              value: "navidrome"
+            - name: PG_USER
+              value: "postgres"
+            - name: PG_PASS
+              value: "navidrome2026"
+            - name: MLFLOW_TRACKING_URI
+              value: "http://mlflow.navidrome-platform.svc.cluster.local:8000"
+            - name: OS_AUTH_URL
+              value: "https://chi.uc.chameleoncloud.org:5000/v3"
+            - name: OS_APPLICATION_CREDENTIAL_ID
+              value: "648ff7bbd6644376bae2177818acc3fb"
+            - name: OS_APPLICATION_CREDENTIAL_SECRET
+              value: "21CQ_fWzYJF-sY1OMzkNt8zWmNBAfyrv3QmNH0qh67PeS2EYw5YaW8blTBcZO7mq8Mg3l2CrgiEo86EJHVXxaQ"
+            volumeMounts:
+            - name: script
+              mountPath: /app
+          volumes:
+          - name: script
+            configMap:
+              name: live-dataset-builder-code-proj05
+          restartPolicy: OnFailure
