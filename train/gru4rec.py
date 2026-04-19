@@ -93,7 +93,7 @@ cfg = {
 
     # ---- Evaluation ----
     "top_n":                 20,
-    "eval_every_n_epochs":   5,
+    "eval_every_n_epochs":   1,
     "eval_batch_size":       2048,
     "max_eval_sessions":     5000,       # NEW: subsample for speed during training
     "full_eval_at_end":      True,       # NEW: run full eval on final epoch
