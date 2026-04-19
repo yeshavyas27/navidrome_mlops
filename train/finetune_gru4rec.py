@@ -53,6 +53,8 @@ import argparse
 import tempfile
 from datetime import datetime, timezone
 
+import requests
+
 import torch
 import mlflow
 from torch.utils.data import DataLoader
@@ -116,7 +118,86 @@ FINETUNE_CFG = {
     # ---- MLflow ----
     "mlflow_tracking_uri":  os.environ.get("MLFLOW_TRACKING_URI", "http://129.114.27.204:8000"),
     "mlflow_experiment":    "30music-session-recommendation-finetune",
+
+    # ---- Cache / Swift ----
+    "cache_dir":            ".cache_gru4rec",
+    "finetune_dataset_version": "",   # e.g. "v20260419-finetune-001"; if set, data is pulled from Swift
 }
+
+
+# ============================================================
+# SWIFT DATA LOADING
+# ============================================================
+
+def prepare_finetune_data(cfg: dict) -> dict:
+    """
+    Downloads fine-tune sequences from the Swift bucket.
+
+    Swift URL:
+        https://chi.uc.chameleoncloud.org:7480/swift/v1/AUTH_7c0a7a1952e44c94aa75cae1ff5dc9b4/navidrome-bucket-proj05/datasets/{version}/
+    Expected files: train_sequences.pkl, test_sequences.pkl, item2idx.json, user2idx.json
+    """
+    version   = cfg["finetune_dataset_version"]
+    base_url  = (
+        f"https://chi.uc.chameleoncloud.org:7480/swift/v1/"
+        f"AUTH_7c0a7a1952e44c94aa75cae1ff5dc9b4/navidrome-bucket-proj05/datasets/{version}"
+    )
+    cache_dir = cfg.get("cache_dir", ".cache_gru4rec")
+    os.makedirs(cache_dir, exist_ok=True)
+
+    def download(fname):
+        local = os.path.join(cache_dir, f"{version}_{fname}")
+        if os.path.exists(local):
+            log.info(f"[cache] Using cached {fname}")
+            return local
+        log.info(f"Downloading {fname} from Swift ...")
+        r = requests.get(f"{base_url}/{fname}", timeout=300, stream=True)
+        r.raise_for_status()
+        with open(local, "wb") as fh:
+            for chunk in r.iter_content(chunk_size=8192):
+                fh.write(chunk)
+        log.info(f"Downloaded {fname} ({os.path.getsize(local)/1e6:.1f} MB)")
+        return local
+
+    train_path    = download("train_sequences.pkl")
+    test_path     = download("test_sequences.pkl")
+    item2idx_path = download("item2idx.json")
+    user2idx_path = download("user2idx.json")
+
+    log.info("Loading train_sequences.pkl ...")
+    with open(train_path, "rb") as fh:
+        train_seqs = pickle.load(fh)
+
+    log.info("Loading test_sequences.pkl ...")
+    with open(test_path, "rb") as fh:
+        test_seqs = pickle.load(fh)
+
+    log.info("Loading item2idx.json ...")
+    with open(item2idx_path) as fh:
+        item2idx_raw = json.load(fh)
+    item2idx = {int(k): int(v) for k, v in item2idx_raw.items()}
+
+    log.info("Loading user2idx.json ...")
+    with open(user2idx_path) as fh:
+        user2idx_raw = json.load(fh)
+    user2idx = {int(k): int(v) for k, v in user2idx_raw.items()}
+
+    log.info(
+        f"Fine-tune dataset {version} loaded: "
+        f"{len(train_seqs):,} train seqs, "
+        f"{len(test_seqs):,} test seqs, "
+        f"{len(item2idx):,} items, "
+        f"{len(user2idx):,} users"
+    )
+
+    return {
+        "item2idx":   item2idx,
+        "user2idx":   user2idx,
+        "train_seqs": train_seqs,
+        "test_seqs":  test_seqs,
+        "num_items":  len(item2idx),
+        "num_users":  len(user2idx),
+    }
 
 
 # ============================================================
@@ -180,7 +261,8 @@ def run_finetuning(
     pretrain_model_key: str,    # MinIO key OR None
     pretrain_vocab_path: str,   # local vocab pkl OR None
     pretrain_vocab_key: str,    # MinIO vocab key OR None
-    finetune_data_path: str,
+    finetune_data_path: str = None,   # local pickle (prepare_data() output) OR None
+    ft_data: dict = None,             # pre-loaded data dict (from prepare_finetune_data) OR None
     data_version: str = "",     # dataset ID / version tag for lineage tracking
 ) -> dict:
 
@@ -199,8 +281,11 @@ def run_finetuning(
     log.info(f"Pretrained catalog: {num_items} items")
 
     # 2. Load fine-tune data
-    with open(finetune_data_path, "rb") as f:
-        ft_data = pickle.load(f)
+    if ft_data is None:
+        if finetune_data_path is None:
+            raise ValueError("Either ft_data or finetune_data_path must be provided")
+        with open(finetune_data_path, "rb") as f:
+            ft_data = pickle.load(f)
     log.info(
         f"Fine-tune data: {len(ft_data['train_seqs'])} train, "
         f"{len(ft_data['test_seqs'])} test sessions"
@@ -286,7 +371,7 @@ def run_finetuning(
             "test_sessions":       len(test_seqs),
             "train_samples":       len(train_dataset),
             "pretrain_model_key":  pretrain_model_key or os.path.basename(checkpoint_path or ""),
-            "finetune_data_version": data_version or os.path.basename(finetune_data_path),
+            "finetune_data_version": data_version or (os.path.basename(finetune_data_path) if finetune_data_path else ""),
         })
         mlflow.set_tags({"model_type": "GRU4Rec-InBatch-Finetune", "run_type": "finetune"})
         log_environment_to_mlflow(env_info)
@@ -372,7 +457,7 @@ def run_finetuning(
                             "num_layers":            ft_cfg["num_layers"],
                             "epoch":                 epoch,
                             "pretrain_source":       pretrain_model_key or checkpoint_path or "",
-                            "finetune_data_version": data_version or os.path.basename(finetune_data_path),
+                            "finetune_data_version": data_version or (os.path.basename(finetune_data_path) if finetune_data_path else ""),
                             "gpu_name":              env_info.get("gpu_name", ""),
                             "git_sha":               env_info.get("git_sha", ""),
                         }
@@ -436,7 +521,18 @@ def parse_args():
     voc.add_argument("--pretrain-vocab-key", help="MinIO key for pretrained vocab.pkl")
     voc.add_argument("--pretrain-vocab",     help="Local pretrained vocab pickle (item2idx)")
 
-    p.add_argument("--finetune-data", required=True, help="Fine-tune data pickle (prepare_data() output)")
+    # Fine-tune data source — Swift version tag OR local pickle (mutually exclusive)
+    ft_data_src = p.add_mutually_exclusive_group(required=True)
+    ft_data_src.add_argument(
+        "--finetune-data-version",
+        help="Swift dataset version to pull (e.g. v20260419-finetune-001). "
+             "Downloads train_sequences.pkl, test_sequences.pkl, item2idx.json, user2idx.json "
+             "from the Swift bucket.",
+    )
+    ft_data_src.add_argument(
+        "--finetune-data",
+        help="Local fine-tune data pickle (prepare_data() output)",
+    )
 
     # Arch — must match the pretrained checkpoint
     p.add_argument("--embedding-dim", type=int,   default=FINETUNE_CFG["embedding_dim"])
@@ -454,6 +550,8 @@ def parse_args():
     p.add_argument("--device",       default=FINETUNE_CFG["device"])
     p.add_argument("--mlflow-uri",   default=FINETUNE_CFG["mlflow_tracking_uri"])
     p.add_argument("--experiment",   default=FINETUNE_CFG["mlflow_experiment"])
+    p.add_argument("--cache-dir",    default=FINETUNE_CFG["cache_dir"],
+                   help="Local directory for caching downloaded Swift files")
     p.add_argument("--data-version", default="",
                    help="Dataset version/ID tag for lineage (e.g. v20260419-live). "
                         "Defaults to the finetune data filename.")
@@ -476,9 +574,16 @@ def main():
         "device":              args.device,
         "mlflow_tracking_uri": args.mlflow_uri,
         "mlflow_experiment":   args.experiment,
+        "cache_dir":           args.cache_dir,
     })
 
     log.info(json.dumps(ft_cfg, indent=2, default=str))
+
+    # Pull fine-tune data from Swift if a version tag was given
+    ft_data_dict = None
+    if args.finetune_data_version:
+        ft_cfg["finetune_dataset_version"] = args.finetune_data_version
+        ft_data_dict = prepare_finetune_data(ft_cfg)
 
     results = run_finetuning(
         ft_cfg=ft_cfg,
@@ -487,7 +592,8 @@ def main():
         pretrain_vocab_path=args.pretrain_vocab,
         pretrain_vocab_key=args.pretrain_vocab_key,
         finetune_data_path=args.finetune_data,
-        data_version=args.data_version,
+        ft_data=ft_data_dict,
+        data_version=args.data_version or args.finetune_data_version or "",
     )
 
     print(f"\nbest_session_HR@{ft_cfg['top_n']}: {results['best_session_HR']:.4f}")
