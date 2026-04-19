@@ -1,0 +1,6 @@
+[submodule "navidrome-iac"]
+	path = navidrome-iac
+	url = git@github.com:salawhaaat/navidrome-iac.git
+[submodule "navidrome-recommendations"]
+	path = navidrome-recommendations
+	url = git@github.com:vanshika2022/navidrome-recommendations.git
