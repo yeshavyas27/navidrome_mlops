@@ -1,9 +1,10 @@
 """
-Navidrome Feedback API — Production Version
+Navidrome Feedback API — Production Version v3
 Receives live session events from Navidrome scrobbler
 Writes to PostgreSQL permanently
 Buffers to Swift as parquet batches
 Uses Redis for instant vocab lookups during inference
+Auto-detects latest dataset version from Swift
 
 Internal K8S endpoints:
   PostgreSQL: postgres.navidrome-platform.svc.cluster.local:5432
@@ -24,22 +25,21 @@ from pydantic import BaseModel
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger(__name__)
 
-app = FastAPI(title="Navidrome Feedback API", version="2.0")
+app = FastAPI(title="Navidrome Feedback API", version="3.0")
 
 # ============================================================
 # CONFIG
 # ============================================================
-PG_HOST          = os.getenv("PG_HOST",     "postgres.navidrome-platform.svc.cluster.local")
-PG_PORT          = int(os.getenv("PG_PORT", "5432"))
-PG_DB            = os.getenv("PG_DB",       "navidrome")
-PG_USER          = os.getenv("PG_USER",     "postgres")
-PG_PASS          = os.getenv("PG_PASS",     "navidrome2026")
-REDIS_HOST       = os.getenv("REDIS_HOST",  "redis.navidrome-platform.svc.cluster.local")
-REDIS_PORT       = int(os.getenv("REDIS_PORT", "6379"))
-DATASET_VERSION  = os.getenv("DATASET_VERSION", "v20260418-001")
-SWIFT_CONTAINER  = "navidrome-bucket-proj05"
-SWIFT_BASE_URL   = f"https://chi.uc.chameleoncloud.org:7480/swift/v1/AUTH_7c0a7a1952e44c94aa75cae1ff5dc9b4/{SWIFT_CONTAINER}"
-BUFFER_SIZE      = 100
+PG_HOST         = os.getenv("PG_HOST",     "postgres.navidrome-platform.svc.cluster.local")
+PG_PORT         = int(os.getenv("PG_PORT", "5432"))
+PG_DB           = os.getenv("PG_DB",       "navidrome")
+PG_USER         = os.getenv("PG_USER",     "postgres")
+PG_PASS         = os.getenv("PG_PASS",     "navidrome2026")
+REDIS_HOST      = os.getenv("REDIS_HOST",  "redis.navidrome-platform.svc.cluster.local")
+REDIS_PORT      = int(os.getenv("REDIS_PORT", "6379"))
+SWIFT_CONTAINER = "navidrome-bucket-proj05"
+SWIFT_BASE_URL  = f"https://chi.uc.chameleoncloud.org:7480/swift/v1/AUTH_7c0a7a1952e44c94aa75cae1ff5dc9b4/{SWIFT_CONTAINER}"
+BUFFER_SIZE     = 100
 
 AUTH_ARGS = [
     "--os-auth-url",   os.getenv("OS_AUTH_URL", ""),
@@ -47,6 +47,33 @@ AUTH_ARGS = [
     "--os-application-credential-id",     os.getenv("OS_APPLICATION_CREDENTIAL_ID", ""),
     "--os-application-credential-secret", os.getenv("OS_APPLICATION_CREDENTIAL_SECRET", ""),
 ]
+
+# ============================================================
+# DYNAMIC DATASET VERSION — always use latest
+# ============================================================
+def get_latest_dataset_version() -> str:
+    """Find latest dataset version from Swift by listing datasets/ prefix."""
+    try:
+        r = subprocess.run(
+            ["swift"] + AUTH_ARGS + ["list", SWIFT_CONTAINER, "--prefix", "datasets/"],
+            capture_output=True, text=True
+        )
+        lines = [l.strip() for l in r.stdout.strip().split("\n") if l.strip()]
+        # lines look like: datasets/v20260418-001/interactions.parquet
+        versions = set()
+        for line in lines:
+            parts = line.split("/")
+            if len(parts) >= 2 and parts[1].startswith("v"):
+                versions.add(parts[1])
+        if versions:
+            latest = sorted(versions)[-1]
+            log.info(f"Latest dataset version: {latest}")
+            return latest
+    except Exception as e:
+        log.warning(f"Could not detect dataset version: {e}")
+    return "v20260418-001"  # fallback
+
+DATASET_VERSION = os.getenv("DATASET_VERSION") or get_latest_dataset_version()
 
 # ============================================================
 # CONNECTIONS
@@ -82,7 +109,7 @@ def get_redis():
 # ============================================================
 @app.on_event("startup")
 async def startup():
-    log.info("Starting Navidrome Feedback API v2...")
+    log.info(f"Starting Navidrome Feedback API v3 | dataset: {DATASET_VERSION}")
     await setup_postgres()
     await load_vocab_to_redis()
 
@@ -118,15 +145,20 @@ async def setup_postgres():
 async def load_vocab_to_redis():
     try:
         r = get_redis()
-        if r.exists("vocab:loaded"):
-            log.info(f"Redis vocab already loaded (version: {r.get('vocab:version')})")
+        current_version = r.get("vocab:version")
+        if current_version == DATASET_VERSION:
+            log.info(f"Redis vocab already loaded for {DATASET_VERSION}")
             return
+        # version changed or not loaded — reload
         log.info(f"Loading vocab from Swift dataset {DATASET_VERSION}...")
         for vocab_name, redis_key in [("item2idx", "vocab:item2idx"), ("user2idx", "vocab:user2idx")]:
             url  = f"{SWIFT_BASE_URL}/datasets/{DATASET_VERSION}/{vocab_name}.json"
             resp = requests.get(url, timeout=120)
             resp.raise_for_status()
             vocab = resp.json()
+            # clear old vocab
+            r.delete(redis_key)
+            # load in batches
             pipe  = r.pipeline()
             items = list(vocab.items())
             for i in range(0, len(items), 10000):
@@ -135,7 +167,7 @@ async def load_vocab_to_redis():
             log.info(f"  {vocab_name}: {len(vocab):,} entries loaded")
         r.set("vocab:loaded",   "1")
         r.set("vocab:version",  DATASET_VERSION)
-        log.info("Redis vocab loaded successfully")
+        log.info(f"Redis vocab loaded for version {DATASET_VERSION}")
     except Exception as e:
         log.error(f"Redis vocab load failed: {e}")
 
@@ -237,7 +269,6 @@ def flush_to_swift():
     ts  = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     tmp = f"/tmp/batch_{ts}.parquet"
     df.to_parquet(tmp, index=False, engine="pyarrow")
-
     name = f"production/sessions/sessions_{ts}_batch{len(batch):04d}.parquet"
     subprocess.run(["swift"] + AUTH_ARGS + [
         "upload", "--object-name", name, SWIFT_CONTAINER, tmp
@@ -269,14 +300,21 @@ async def preprocess(session_id: str, user_id: str, track_ids: str, playratios: 
 
 @app.post("/api/reload-vocab")
 async def reload_vocab():
+    """Force reload vocab — call this after retraining."""
+    global DATASET_VERSION
     r = get_redis()
     r.delete("vocab:loaded")
+    r.delete("vocab:version")
+    DATASET_VERSION = get_latest_dataset_version()
     await load_vocab_to_redis()
     return {"status": "reloaded", "version": DATASET_VERSION}
 
 @app.get("/health")
 async def health():
-    status = {"api": "ok", "postgres": "unknown", "redis": "unknown"}
+    status = {
+        "api":             "ok",
+        "dataset_version": DATASET_VERSION,
+    }
     try:
         conn = get_pg()
         conn.cursor().execute("SELECT 1")
@@ -287,6 +325,7 @@ async def health():
     try:
         get_redis().ping()
         status["redis"] = "ok"
+        status["vocab_version"] = get_redis().get("vocab:version")
     except Exception as e:
         status["redis"] = str(e)
     return status
@@ -314,6 +353,7 @@ async def stats():
             "live_sessions":      row[3],
             "navidrome_sessions": row[4],
             "buffer_size":        len(event_buffer),
+            "dataset_version":    DATASET_VERSION,
             "vocab_version":      get_redis().get("vocab:version"),
         }
     except Exception as e:
