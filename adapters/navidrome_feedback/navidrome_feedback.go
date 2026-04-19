@@ -94,14 +94,15 @@ func (f *feedbackScrobbler) Scrobble(ctx context.Context, userID string, s scrob
 	entry.LastPlay   = now
 
 	if len(entry.TrackIDs) >= 3 {
-		go f.sendSession(userID, entry)
+		entryCopy := *entry
+		go f.sendSession(ctx, userID, &entryCopy)
 		delete(buf.sessions, userID)
 	}
 
 	return nil
 }
 
-func (f *feedbackScrobbler) sendSession(userID string, entry *sessionEntry) {
+func (f *feedbackScrobbler) sendSession(ctx context.Context, userID string, entry *sessionEntry) {
 	sessionID := fmt.Sprintf("%s_%d", userID, entry.StartTime.Unix())
 	payload := feedbackPayload{
 		SessionID:      sessionID,
@@ -114,7 +115,7 @@ func (f *feedbackScrobbler) sendSession(userID string, entry *sessionEntry) {
 
 	body, err := json.Marshal(payload)
 	if err != nil {
-		log.Error(context.Background(), "Failed to marshal ML session", "user", userID, err)
+		log.Error(ctx, "Failed to marshal ML session", "user", userID, err)
 		return
 	}
 
@@ -124,12 +125,12 @@ func (f *feedbackScrobbler) sendSession(userID string, entry *sessionEntry) {
 		bytes.NewReader(body),
 	)
 	if err != nil {
-		log.Error(context.Background(), "Failed to send ML session", "user", userID, err)
+		log.Error(ctx, "Failed to send ML session", "user", userID, err)
 		return
 	}
 	defer resp.Body.Close()
 
-	log.Info(context.Background(), "ML session sent",
+	log.Info(ctx, "ML session sent",
 		"user", userID,
 		"tracks", len(entry.TrackIDs),
 		"status", resp.StatusCode,
