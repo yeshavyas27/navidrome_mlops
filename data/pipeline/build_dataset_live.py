@@ -32,7 +32,7 @@ log = logging.getLogger(__name__)
 # ============================================================
 CONTAINER  = "navidrome-bucket-proj05"
 RUN_ID     = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-VERSION    = f"v{datetime.now(timezone.utc).strftime('%Y%m%d')}-live-001"
+VERSION    = f"v{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-live"
 
 # PostgreSQL
 PG_HOST = os.getenv("PG_HOST", "postgres.navidrome-platform.svc.cluster.local")
@@ -83,7 +83,7 @@ def list_objects(prefix):
 # ============================================================
 # STEP 1 — Load live sessions from PostgreSQL
 # ============================================================
-def load_postgres_sessions(since_hours=2):
+def load_postgres_sessions(since_hours=None):
     """
     Load live sessions from PostgreSQL.
     since_hours: None = all data, 24 = last 24 hours
@@ -435,7 +435,7 @@ if __name__ == "__main__":
     log.info(f"Version: {VERSION}")
 
     # Step 1 — load from PostgreSQL
-    pg_df = load_postgres_sessions(since_hours=2)  # all data
+    pg_df = load_postgres_sessions(since_hours=None)  # all data
 
     if len(pg_df) < 100:
         log.warning(f"Only {len(pg_df)} sessions — skipping build (need at least 100)")
