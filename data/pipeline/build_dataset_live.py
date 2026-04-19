@@ -83,7 +83,7 @@ def list_objects(prefix):
 # ============================================================
 # STEP 1 — Load live sessions from PostgreSQL
 # ============================================================
-def load_postgres_sessions(since_hours=None):
+def load_postgres_sessions(since_hours=2):
     """
     Load live sessions from PostgreSQL.
     since_hours: None = all data, 24 = last 24 hours
@@ -435,7 +435,7 @@ if __name__ == "__main__":
     log.info(f"Version: {VERSION}")
 
     # Step 1 — load from PostgreSQL
-    pg_df = load_postgres_sessions(since_hours=None)  # all data
+    pg_df = load_postgres_sessions(since_hours=2)  # all data
 
     if len(pg_df) < 100:
         log.warning(f"Only {len(pg_df)} sessions — skipping build (need at least 100)")
