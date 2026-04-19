@@ -109,6 +109,9 @@ cfg = {
     # ---- MLflow ----
     "mlflow_tracking_uri":   "http://129.114.25.168:8000",
     "mlflow_experiment":     "30music-session-recommendation",
+
+    # ---- Dataset version (from data team Swift bucket) ----
+    "dataset_version":       "v20260418-001",
 }
 
 ENTITIES_DIR  = os.path.join(cfg["dataset_root"], "entities")
@@ -805,45 +808,66 @@ def evaluate(model, test_sequences: list, run_cfg: dict, device: torch.device,
 # ============================================================
 
 def prepare_data(cfg: dict) -> dict:
+    """
+    Loads pre-built training data from Swift bucket.
+    Replaces idomaar parsing — data already filtered, vocab built, sequences ready.
+    
+    Swift URL: https://chi.uc.chameleoncloud.org:7480/swift/v1/AUTH_7c0a7a1952e44c94aa75cae1ff5dc9b4/navidrome-bucket-proj05/datasets/{version}/
+    Files: train_sequences.pkl, test_sequences.pkl, item2idx.json, user2idx.json
+    """
+    import pickle, json, requests, os
+
+    version  = cfg.get("dataset_version", "v20260418-001")
+    base_url = f"https://chi.uc.chameleoncloud.org:7480/swift/v1/AUTH_7c0a7a1952e44c94aa75cae1ff5dc9b4/navidrome-bucket-proj05/datasets/{version}"
     cache_dir = cfg.get("cache_dir", ".cache_gru4rec")
-    key       = _cache_key(cfg)
-    log.info(f"[cache] Config hash: {key}")
+    os.makedirs(cache_dir, exist_ok=True)
 
-    sessions = _load_cache("sessions", key, cache_dir)
-    if sessions is None:
-        sessions = parse_sessions(find_idomaar_file(RELATIONS_DIR, "sessions"), cfg)
-        if not sessions:
-            raise RuntimeError("No sessions parsed!")
-        _save_cache("sessions", key, sessions, cache_dir)
+    def download(fname):
+        local = os.path.join(cache_dir, f"{version}_{fname}")
+        if os.path.exists(local):
+            log.info(f"[cache] Using cached {fname}")
+            return local
+        log.info(f"Downloading {fname} from Swift...")
+        r = requests.get(f"{base_url}/{fname}", timeout=300, stream=True)
+        r.raise_for_status()
+        with open(local, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
+        log.info(f"Downloaded {fname} ({os.path.getsize(local)/1e6:.1f} MB)")
+        return local
 
-    dfs = _load_cache("dataframes", key, cache_dir)
-    if dfs is None:
-        dfs = sessions_to_dataframe(sessions, cfg)
-        _save_cache("dataframes", key, dfs, cache_dir)
-    session_df, interaction_df = dfs
+    # download all four files
+    train_path  = download("train_sequences.pkl")
+    test_path   = download("test_sequences.pkl")
+    item2idx_path = download("item2idx.json")
+    user2idx_path = download("user2idx.json")
 
-    filtered = _load_cache("filtered", key, cache_dir)
-    if filtered is None:
-        filtered = filter_data(session_df, interaction_df, cfg)
-        _save_cache("filtered", key, filtered, cache_dir)
-    session_df, interaction_df = filtered
+    # load
+    log.info("Loading train_sequences.pkl...")
+    with open(train_path, "rb") as f:
+        train_seqs = pickle.load(f)
 
-    vocabs = _load_cache("vocabs", key, cache_dir)
-    if vocabs is None:
-        vocabs = build_vocabs(interaction_df)
-        _save_cache("vocabs", key, vocabs, cache_dir)
-    item2idx, user2idx = vocabs
+    log.info("Loading test_sequences.pkl...")
+    with open(test_path, "rb") as f:
+        test_seqs = pickle.load(f)
 
-    sequences = _load_cache("sequences", key, cache_dir)
-    if sequences is None:
-        sequences = build_sequences(interaction_df, item2idx, user2idx)
-        _save_cache("sequences", key, sequences, cache_dir)
+    log.info("Loading item2idx.json...")
+    with open(item2idx_path) as f:
+        item2idx_raw = json.load(f)
+    item2idx = {int(k): int(v) for k, v in item2idx_raw.items()}
 
-    splits = _load_cache("splits", key, cache_dir)
-    if splits is None:
-        splits = temporal_split(session_df, sequences, cfg)
-        _save_cache("splits", key, splits, cache_dir)
-    train_seqs, test_seqs = splits
+    log.info("Loading user2idx.json...")
+    with open(user2idx_path) as f:
+        user2idx_raw = json.load(f)
+    user2idx = {int(k): int(v) for k, v in user2idx_raw.items()}
+
+    log.info(
+        f"Dataset {version} loaded: "
+        f"{len(train_seqs):,} train seqs, "
+        f"{len(test_seqs):,} test seqs, "
+        f"{len(item2idx):,} items, "
+        f"{len(user2idx):,} users"
+    )
 
     return {
         "item2idx":   item2idx,
