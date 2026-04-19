@@ -16,10 +16,12 @@ Usage
     predictions = cs.predict(model, prefix_items, user_idxs, all_item_emb, top_n=20)
 """
 
-import math
+import logging
 import torch
 import numpy as np
 from collections import Counter
+
+log = logging.getLogger(__name__)
 
 
 class ColdStartRecommender:
