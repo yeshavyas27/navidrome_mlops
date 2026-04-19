@@ -238,6 +238,44 @@ def download_metadata(s3, run_type: str, run_id: str,
 
 
 # ============================================================
+# DISCOVERY — find latest model
+# ============================================================
+
+def get_latest_model_key(s3, run_type: str = "finetune", bucket: str = None) -> str | None:
+    """Return the MinIO key of the most recently uploaded model.pt for run_type.
+
+    Searches finetune/ first; falls back to pretrain/ if nothing found and
+    run_type was 'finetune'.  Returns None if the bucket is empty.
+
+    Key layout: {run_type}/{YYYY-MM-DD}/{run_id}/model.pt
+    """
+    bucket = bucket or os.environ.get("MINIO_BUCKET", DEFAULT_BUCKET)
+
+    def _latest_in(prefix):
+        paginator = s3.get_paginator("list_objects_v2")
+        best_key, best_ts = None, None
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                if obj["Key"].endswith("/model.pt"):
+                    if best_ts is None or obj["LastModified"] > best_ts:
+                        best_key = obj["Key"]
+                        best_ts  = obj["LastModified"]
+        return best_key
+
+    key = _latest_in(f"{run_type}/")
+    if key is None and run_type == "finetune":
+        log.info("[minio] No finetune model found, falling back to pretrain/")
+        key = _latest_in("pretrain/")
+
+    if key:
+        log.info(f"[minio] Latest {run_type} model: {key}")
+    else:
+        log.warning(f"[minio] No model.pt found under {run_type}/ in bucket {bucket}")
+
+    return key
+
+
+# ============================================================
 # POPULARITY (cold-start)
 # ============================================================
 
