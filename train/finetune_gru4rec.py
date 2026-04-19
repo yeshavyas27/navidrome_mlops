@@ -68,7 +68,11 @@ from gru4rec import (
     log_environment_to_mlflow,
     get_gpu_memory_stats,
 )
-from minio_store import get_client, push_run_artifacts, download_model, download_vocab
+try:
+    from minio_store import get_client, push_run_artifacts, download_model, download_vocab
+    MINIO_AVAILABLE = True
+except ImportError:
+    MINIO_AVAILABLE = False
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
@@ -110,7 +114,7 @@ FINETUNE_CFG = {
     "num_workers":          4,
 
     # ---- MLflow ----
-    "mlflow_tracking_uri":  "http://129.114.25.168:8000",
+    "mlflow_tracking_uri":  os.environ.get("MLFLOW_TRACKING_URI", "http://129.114.27.204:8000"),
     "mlflow_experiment":    "30music-session-recommendation-finetune",
 }
 
@@ -180,7 +184,7 @@ def run_finetuning(
 ) -> dict:
 
     device = torch.device(ft_cfg["device"])
-    s3     = get_client()
+    s3     = get_client() if MINIO_AVAILABLE and (pretrain_vocab_key or pretrain_model_key) else None
 
     # 1. Load pretrained vocab (fixed catalog)
     if pretrain_vocab_key:
@@ -370,8 +374,8 @@ def run_finetuning(
             "epochs_trained":         epochs_trained,
         })
 
-        # 8. Push best model + metadata to MinIO (skipped if credentials not set)
-        if best_state_dict is not None:
+        # 8. Push best model + metadata to MinIO (skipped if not available)
+        if best_state_dict is not None and MINIO_AVAILABLE:
             metadata = {
                 "run_type":        "finetune",
                 "mlflow_run_id":   run.info.run_id,

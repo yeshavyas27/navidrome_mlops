@@ -113,7 +113,7 @@ cfg = {
     "study_name":            "gru4rec_tuning",
 
     # ---- MLflow ----
-    "mlflow_tracking_uri":   "http://129.114.25.168:8000",
+    "mlflow_tracking_uri":   os.environ.get("MLFLOW_TRACKING_URI", "http://129.114.27.204:8000"),
     "mlflow_experiment":     "30music-session-recommendation",
 
     # ---- Dataset version (from data team Swift bucket) ----
