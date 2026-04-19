@@ -47,11 +47,11 @@ RUN useradd -m -s /bin/bash appuser
 
 WORKDIR /home/appuser/work
 
-COPY . .
+COPY train/ .
 
 # 7. Project dependencies
 RUN python3 -m pip install --no-cache-dir --upgrade pip wheel setuptools && \
-    python3 -m pip install --no-cache-dir -r train/requirements.txt
+    python3 -m pip install --no-cache-dir -r requirements.txt
 
 RUN chown -R appuser:appuser /home/appuser/work
 
