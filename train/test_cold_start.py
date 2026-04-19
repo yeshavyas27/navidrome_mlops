@@ -176,7 +176,9 @@ def predict(prefix_list, use_cold_start=True):
     if use_cold_start and pop_available:
         a      = alpha(slen)
         gru_l  = torch.log_softmax(gru_scores, dim=-1)
-        pop_l  = torch.log_softmax(pop_scores, dim=-1)
+        # Align popularity to model vocab size (finetune model may be smaller)
+        pop_aligned = pop_scores[:num_items]
+        pop_l  = torch.log_softmax(pop_aligned, dim=-1)
         scores = a * gru_l + (1 - a) * pop_l
     else:
         a      = 1.0
