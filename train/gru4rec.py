@@ -1186,6 +1186,19 @@ def main():
 
     data = prepare_data(cfg)
 
+    # Export popularity scores for serving-side cold-start blending
+    try:
+        from cold_start import ColdStartRecommender
+        cs = ColdStartRecommender(data["train_seqs"], data["num_items"])
+        pop_path = os.path.join(cfg["cache_dir"], "popularity.npy")
+        cs.save_popularity(pop_path)
+        if MINIO_AVAILABLE:
+            from minio_store import get_client, upload_popularity
+            pop_key = f"shared/{cfg['dataset_version']}/popularity.npy"
+            upload_popularity(get_client(), pop_path, pop_key)
+    except Exception as e:
+        log.warning(f"Cold-start popularity export failed (non-fatal): {e}")
+
     if cfg["mode"] == "tune":
         run_optuna_tuning(base_cfg=cfg, data=data, env_info=env_info)
     else:

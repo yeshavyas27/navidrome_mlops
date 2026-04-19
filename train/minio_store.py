@@ -238,6 +238,42 @@ def download_metadata(s3, run_type: str, run_id: str,
 
 
 # ============================================================
+# POPULARITY (cold-start)
+# ============================================================
+
+def upload_popularity(s3, local_path: str, key: str, bucket: str = None) -> str:
+    """Upload a popularity.npy file to MinIO under an explicit key.
+
+    Key convention: shared/{dataset_version}/popularity.npy
+    Returns the object key.
+    """
+    bucket = bucket or os.environ.get("MINIO_BUCKET", DEFAULT_BUCKET)
+    ensure_bucket(s3, bucket)
+
+    with open(local_path, "rb") as fh:
+        s3.upload_fileobj(
+            fh, bucket, key,
+            ExtraArgs={"ContentType": "application/octet-stream"},
+        )
+
+    log.info(f"[minio] Uploaded popularity → s3://{bucket}/{key}")
+    return key
+
+
+def download_popularity(s3, key: str, local_path: str, bucket: str = None):
+    """Download popularity.npy from MinIO to local_path."""
+    bucket = bucket or os.environ.get("MINIO_BUCKET", DEFAULT_BUCKET)
+
+    import os as _os
+    _os.makedirs(_os.path.dirname(local_path) or ".", exist_ok=True)
+
+    with open(local_path, "wb") as fh:
+        s3.download_fileobj(bucket, key, fh)
+
+    log.info(f"[minio] Downloaded popularity s3://{bucket}/{key} → {local_path}")
+
+
+# ============================================================
 # CONVENIENCE: upload all artifacts in one call
 # ============================================================
 
