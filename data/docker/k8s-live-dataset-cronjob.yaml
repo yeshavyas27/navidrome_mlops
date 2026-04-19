@@ -4,7 +4,7 @@ metadata:
   name: live-dataset-builder-proj05
   namespace: navidrome-platform
 spec:
-  schedule: "*/5 * * * *"   # runs every day at 2am UTC
+  schedule: "0 2 * * *"   # every day at 2am UTC
   jobTemplate:
     spec:
       template:
@@ -14,7 +14,8 @@ spec:
             image: python:3.10-slim
             command: ["/bin/sh", "-c"]
             args:
-              - "pip install pandas pyarrow psycopg2-binary mlflow numpy python-swiftclient python-keystoneclient requests -q &&
+              - "pip install pandas pyarrow psycopg2-binary mlflow numpy
+                 python-swiftclient python-keystoneclient boto3 requests -q &&
                  python /app/build_dataset_live.py"
             env:
             - name: PG_HOST
@@ -24,6 +25,12 @@ spec:
             - name: PG_USER
               value: "postgres"
             - name: PG_PASS
+              value: "navidrome2026"
+            - name: MINIO_ENDPOINT
+              value: "http://minio.navidrome-platform.svc.cluster.local:9000"
+            - name: MINIO_ACCESS_KEY
+              value: "minioadmin"
+            - name: MINIO_SECRET_KEY
               value: "navidrome2026"
             - name: MLFLOW_TRACKING_URI
               value: "http://mlflow.navidrome-platform.svc.cluster.local:8000"
