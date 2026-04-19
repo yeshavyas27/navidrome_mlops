@@ -113,8 +113,8 @@ def main():
     torch.save(model.state_dict(), ckpt_path)
     print(f"Saved random pretrained checkpoint")
 
-    # 4. Use a local MLflow tracking dir so no server needed
-    mlflow_uri = f"file://{tmpdir}/mlruns"
+    # 4. Use the real MLflow server (from env) so the run appears in the UI
+    mlflow_uri = os.environ.get("MLFLOW_TRACKING_URI", "http://129.114.27.204:8000")
 
     # 5. Run finetune_gru4rec.py
     print("\n" + "="*55)
@@ -137,9 +137,10 @@ def main():
             "--device",         "cpu",
             "--mlflow-uri",     mlflow_uri,
             "--experiment",     "test-finetune",
+            "--data-version",   "test-v0.0.1",
         ],
         cwd=os.path.dirname(os.path.abspath(__file__)),
-        env={**os.environ, "MINIO_URL": "", "MINIO_USER": "", "MINIO_PASSWORD": ""},
+        env=os.environ.copy(),
     )
 
     if result.returncode != 0:

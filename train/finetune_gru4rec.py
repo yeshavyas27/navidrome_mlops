@@ -181,6 +181,7 @@ def run_finetuning(
     pretrain_vocab_path: str,   # local vocab pkl OR None
     pretrain_vocab_key: str,    # MinIO vocab key OR None
     finetune_data_path: str,
+    data_version: str = "",     # dataset ID / version tag for lineage tracking
 ) -> dict:
 
     device = torch.device(ft_cfg["device"])
@@ -270,7 +271,6 @@ def run_finetuning(
 
     best_session_hr    = 0.0
     best_state_dict    = None
-    best_results       = {}
     epochs_no_improve  = 0
     final_results      = {}
     patience           = ft_cfg["patience"]
@@ -286,6 +286,7 @@ def run_finetuning(
             "test_sessions":       len(test_seqs),
             "train_samples":       len(train_dataset),
             "pretrain_model_key":  pretrain_model_key or os.path.basename(checkpoint_path or ""),
+            "finetune_data_version": data_version or os.path.basename(finetune_data_path),
         })
         mlflow.set_tags({"model_type": "GRU4Rec-InBatch-Finetune", "run_type": "finetune"})
         log_environment_to_mlflow(env_info)
@@ -353,11 +354,43 @@ def run_finetuning(
 
                 if results["session_HR"] > best_session_hr:
                     best_session_hr   = results["session_HR"]
-                    best_results      = results
                     epochs_no_improve = 0
-                    # Keep best weights in memory — upload once at the end
                     best_state_dict   = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                     log.info(f"  -> New best session HR{top_n}: {best_session_hr:.4f}")
+
+                    if MINIO_AVAILABLE:
+                        _meta = {
+                            "run_type":              "finetune",
+                            "mlflow_run_id":         run.info.run_id,
+                            "timestamp":             datetime.now(timezone.utc).isoformat(),
+                            "session_HR":            round(best_session_hr, 6),
+                            "session_MRR":           round(results.get("session_MRR", 0), 6),
+                            "strict_HR":             round(results.get("strict_HR", 0), 6),
+                            "num_items":             num_items,
+                            "embedding_dim":         ft_cfg["embedding_dim"],
+                            "hidden_dim":            ft_cfg["hidden_dim"],
+                            "num_layers":            ft_cfg["num_layers"],
+                            "epoch":                 epoch,
+                            "pretrain_source":       pretrain_model_key or checkpoint_path or "",
+                            "finetune_data_version": data_version or os.path.basename(finetune_data_path),
+                            "gpu_name":              env_info.get("gpu_name", ""),
+                            "git_sha":               env_info.get("git_sha", ""),
+                        }
+                        try:
+                            _keys = push_run_artifacts(
+                                state_dict=best_state_dict,
+                                run_type="finetune",
+                                run_id=run.info.run_id,
+                                metadata=_meta,
+                            )
+                            mlflow.set_tags({
+                                "minio_model_key":    _keys["model_key"],
+                                "minio_metadata_key": _keys["metadata_key"],
+                            })
+                            log.info(f"  [minio] model    → {_keys['model_key']}")
+                            log.info(f"  [minio] metadata → {_keys['metadata_key']}")
+                        except Exception as _e:
+                            log.warning(f"  [minio] Upload skipped — {_e}")
                 else:
                     epochs_no_improve += 1
                     if epochs_no_improve >= patience:
@@ -373,44 +406,6 @@ def run_finetuning(
             "best_session_HR":        best_session_hr,
             "epochs_trained":         epochs_trained,
         })
-
-        # 8. Push best model + metadata to MinIO (skipped if not available)
-        if best_state_dict is not None and MINIO_AVAILABLE:
-            metadata = {
-                "run_type":        "finetune",
-                "mlflow_run_id":   run.info.run_id,
-                "timestamp":       datetime.now(timezone.utc).isoformat(),
-                "session_HR":      round(best_session_hr, 6),
-                "session_MRR":     round(best_results.get("session_MRR", 0), 6),
-                "strict_HR":       round(best_results.get("strict_HR", 0), 6),
-                "num_items":       num_items,
-                "embedding_dim":   ft_cfg["embedding_dim"],
-                "hidden_dim":      ft_cfg["hidden_dim"],
-                "num_layers":      ft_cfg["num_layers"],
-                "epochs_trained":  epochs_trained,
-                "train_sessions":  len(train_seqs),
-                "test_sessions":   len(test_seqs),
-                "top_n":           ft_cfg["top_n"],
-                "pretrain_source": pretrain_model_key or checkpoint_path or "",
-                "gpu_name":        env_info.get("gpu_name", ""),
-                "git_sha":         env_info.get("git_sha", ""),
-            }
-
-            try:
-                keys = push_run_artifacts(
-                    state_dict=best_state_dict,
-                    run_type="finetune",
-                    run_id=run.info.run_id,
-                    metadata=metadata,
-                )
-                mlflow.set_tags({
-                    "minio_model_key":    keys["model_key"],
-                    "minio_metadata_key": keys["metadata_key"],
-                })
-                log.info(f"[minio] model    → {keys['model_key']}")
-                log.info(f"[minio] metadata → {keys['metadata_key']}")
-            except Exception as e:
-                log.warning(f"[minio] Upload skipped — {e}")
 
         log.info(
             f"\nDone. {total_time:.1f}s ({total_time/60:.1f} min) | "
@@ -456,9 +451,12 @@ def parse_args():
     p.add_argument("--patience",   type=int,   default=FINETUNE_CFG["patience"])
 
     # Infra
-    p.add_argument("--device",     default=FINETUNE_CFG["device"])
-    p.add_argument("--mlflow-uri", default=FINETUNE_CFG["mlflow_tracking_uri"])
-    p.add_argument("--experiment", default=FINETUNE_CFG["mlflow_experiment"])
+    p.add_argument("--device",       default=FINETUNE_CFG["device"])
+    p.add_argument("--mlflow-uri",   default=FINETUNE_CFG["mlflow_tracking_uri"])
+    p.add_argument("--experiment",   default=FINETUNE_CFG["mlflow_experiment"])
+    p.add_argument("--data-version", default="",
+                   help="Dataset version/ID tag for lineage (e.g. v20260419-live). "
+                        "Defaults to the finetune data filename.")
     return p.parse_args()
 
 
@@ -489,6 +487,7 @@ def main():
         pretrain_vocab_path=args.pretrain_vocab,
         pretrain_vocab_key=args.pretrain_vocab_key,
         finetune_data_path=args.finetune_data,
+        data_version=args.data_version,
     )
 
     print(f"\nbest_session_HR@{ft_cfg['top_n']}: {results['best_session_HR']:.4f}")
