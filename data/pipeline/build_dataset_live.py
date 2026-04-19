@@ -53,32 +53,40 @@ SKIP_RATIO_THRESHOLD = 0.25
 TEST_FRACTION        = 0.2
 HOLDOUT_FRAC         = 0.15
 
-AUTH_ARGS = [
-    "--os-auth-url",   os.environ.get("OS_AUTH_URL", ""),
-    "--os-auth-type",  "v3applicationcredential",
-    "--os-application-credential-id",     os.environ.get("OS_APPLICATION_CREDENTIAL_ID", ""),
-    "--os-application-credential-secret", os.environ.get("OS_APPLICATION_CREDENTIAL_SECRET", ""),
-]
+# ============================================================
+# SWIFT HELPERS — using swiftclient directly
+# ============================================================
+import swiftclient
 
-# ============================================================
-# SWIFT HELPERS
-# ============================================================
-def swift_run(args):
-    return subprocess.run(["swift"] + AUTH_ARGS + args, capture_output=True, text=True)
+def get_swift_conn():
+    return swiftclient.Connection(
+        authurl=os.environ.get("OS_AUTH_URL", ""),
+        auth_version="3",
+        os_options={
+            "auth_type": "v3applicationcredential",
+            "application_credential_id":     os.environ.get("OS_APPLICATION_CREDENTIAL_ID", ""),
+            "application_credential_secret": os.environ.get("OS_APPLICATION_CREDENTIAL_SECRET", ""),
+        }
+    )
 
 def swift_upload(local, name):
-    swift_run(["upload", "--object-name", name, CONTAINER, local])
+    conn = get_swift_conn()
+    with open(local, "rb") as f:
+        conn.put_object(CONTAINER, name, f)
     log.info(f"  uploaded -> {name} ({os.path.getsize(local)/1e6:.1f} MB)")
 
 def swift_upload_bytes(data, name):
-    tmp = f"/tmp/live_tmp_{RUN_ID}.bin"
-    with open(tmp, "wb") as f: f.write(data)
-    swift_upload(tmp, name)
-    os.remove(tmp)
+    conn = get_swift_conn()
+    conn.put_object(CONTAINER, name, data)
+    log.info(f"  uploaded -> {name}")
 
 def list_objects(prefix):
-    r = swift_run(["list", CONTAINER, "--prefix", prefix])
-    return [l.strip() for l in r.stdout.strip().split("\n") if l.strip()]
+    conn = get_swift_conn()
+    try:
+        _, objects = conn.get_container(CONTAINER, prefix=prefix)
+        return [o["name"] for o in objects]
+    except Exception:
+        return []
 
 # ============================================================
 # STEP 1 — Load live sessions from PostgreSQL
