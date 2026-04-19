@@ -89,9 +89,9 @@ func (f *feedbackScrobbler) Scrobble(ctx context.Context, userID string, s scrob
 		log.Debug(ctx, "New ML session started", "user", userID)
 	}
 
-	entry.TrackIDs   = append(entry.TrackIDs, s.MediaFile.ID)
+	entry.TrackIDs = append(entry.TrackIDs, s.MediaFile.ID)
 	entry.PlayRatios = append(entry.PlayRatios, 1.0)
-	entry.LastPlay   = now
+	entry.LastPlay = now
 
 	if len(entry.TrackIDs) >= 3 {
 		entryCopy := *entry
