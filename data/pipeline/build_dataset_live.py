@@ -45,10 +45,10 @@ PG_PASS = os.getenv("PG_PASS", "navidrome2026")
 MLFLOW_URI = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow.navidrome-platform.svc.cluster.local:8000")
 
 # Yesha's filtering thresholds
-MIN_SESSION_LENGTH   = 3
+MIN_SESSION_LENGTH   = 2
 MAX_SESSION_LENGTH   = 100
-MIN_ITEM_SUPPORT     = 3    # lower than 30Music since less data
-MIN_USER_SESSIONS    = 2    # lower threshold for live data
+MIN_ITEM_SUPPORT     = 1    # lower than 30Music since less data
+MIN_USER_SESSIONS    = 1    # lower threshold for live data
 SKIP_RATIO_THRESHOLD = 0.25
 TEST_FRACTION        = 0.2
 HOLDOUT_FRAC         = 0.15
