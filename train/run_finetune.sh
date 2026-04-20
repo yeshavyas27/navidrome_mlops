@@ -60,7 +60,6 @@ docker run --rm \
   -e MINIO_PASSWORD="$MINIO_PASSWORD" \
   -e MLFLOW_TRACKING_URI="$MLFLOW_URI" \
   train:latest \
-  python3 finetune_gru4rec.py \
-    ${DATA_VERSION:+--data-version "$DATA_VERSION"}
+  python3 train/finetune_gru4rec.py
 
 echo "[finetune] done."
