@@ -43,8 +43,8 @@ MAX_SESSION_LENGTH   = 100
 MIN_ITEM_SUPPORT     = 1
 MIN_USER_SESSIONS    = 1
 SKIP_RATIO_THRESHOLD = 0.25
-TEST_FRACTION        = 0.3
-HOLDOUT_FRAC         = 0.00
+TEST_FRACTION        = 0.2
+HOLDOUT_FRAC         = 0.0
 
 # ============================================================
 # MINIO UPLOAD (primary — always works inside K8S)
@@ -251,16 +251,24 @@ def build_sequences(interaction_df, item2idx, user2idx):
 # STEP 6 — Chronological split — Yesha's temporal_split() logic
 # ============================================================
 def chronological_split(session_df, sequences):
+    log.info("\n[STEP 6] Chronological split (pure temporal — no user holdout)...")
     session_df = session_df.sort_values("timestamp").reset_index(drop=True)
-    split_idx  = int(len(session_df) * (1 - TEST_FRACTION))
-    train_ids  = set(session_df.iloc[:split_idx]["session_id"])
-    test_ids   = set(session_df.iloc[split_idx:]["session_id"])
-    
+
+    split_idx = int(len(session_df) * (1 - TEST_FRACTION))
+    train_ids = set(session_df.iloc[:split_idx]["session_id"])
+    test_ids  = set(session_df.iloc[split_idx:]["session_id"])
+
     train_seqs = [s for s in sequences if s["session_id"] in train_ids]
     test_seqs  = [s for s in sequences if s["session_id"] in test_ids]
-    
+
+    # verify no user overlap issue
+    train_users = set(s["user_idx"] for s in train_seqs)
+    test_users  = set(s["user_idx"] for s in test_seqs)
+    unseen      = test_users - train_users
     log.info(f"  train: {len(train_seqs):,} | test: {len(test_seqs):,}")
+    log.info(f"  unseen users in test: {len(unseen)} (should be 0)")
     return train_seqs, test_seqs
+
 # ============================================================
 # STEP 7 — Upload to MinIO + Swift
 # ============================================================
