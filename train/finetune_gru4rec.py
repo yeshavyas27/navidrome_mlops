@@ -69,7 +69,7 @@ from gru4rec import (
     get_gpu_memory_stats,
 )
 try:
-    from minio_store import get_client, push_run_artifacts, download_model, download_vocab
+    from minio_store import get_client, push_run_artifacts, download_model, download_vocab, get_latest_model_key
     MINIO_AVAILABLE = True
 except ImportError:
     MINIO_AVAILABLE = False
@@ -576,14 +576,14 @@ def run_finetuning(
 def parse_args():
     p = argparse.ArgumentParser(description="Fine-tune GRU4Rec on new Navidrome session data")
 
-    # Checkpoint source — MinIO key OR local file
-    src = p.add_mutually_exclusive_group(required=True)
-    src.add_argument("--pretrain-model-key", help="MinIO key for pretrained model.pt")
+    # Checkpoint source — MinIO key OR local file OR auto-discover (default)
+    src = p.add_mutually_exclusive_group(required=False)
+    src.add_argument("--pretrain-model-key", help="MinIO key for model.pt. If omitted, auto-discovers latest under artifacts/finetune/ (falls back to pretrain/).")
     src.add_argument("--checkpoint",         help="Local pretrained model weights (.pt)")
 
-    # Vocab source — MinIO key OR local file
-    voc = p.add_mutually_exclusive_group(required=True)
-    voc.add_argument("--pretrain-vocab-key", help="MinIO key for pretrained vocab.pkl")
+    # Vocab source — MinIO key OR local file (derived from model key when auto-discovering)
+    voc = p.add_mutually_exclusive_group(required=False)
+    voc.add_argument("--pretrain-vocab-key", help="MinIO key for vocab.pkl. Derived from model key automatically when auto-discovering.")
     voc.add_argument("--pretrain-vocab",     help="Local pretrained vocab pickle (item2idx)")
 
     # Fine-tune data source — Swift version tag OR local pickle (mutually exclusive)
@@ -647,6 +647,23 @@ def main():
 
     log.info(json.dumps(ft_cfg, indent=2, default=str))
 
+    # Auto-discover latest model from MinIO if no checkpoint source was given
+    pretrain_model_key = args.pretrain_model_key
+    pretrain_vocab_key = args.pretrain_vocab_key
+    if not pretrain_model_key and not args.checkpoint:
+        if not MINIO_AVAILABLE:
+            raise RuntimeError("No checkpoint specified and minio_store is not available for auto-discovery.")
+        s3 = get_client()
+        pretrain_model_key = get_latest_model_key(s3, run_type="finetune")
+        if not pretrain_model_key:
+            raise RuntimeError("No model.pt found under artifacts/finetune/ or artifacts/pretrain/ in MinIO.")
+        log.info(f"[auto] Using model: {pretrain_model_key}")
+
+    # Derive vocab key from model key when auto-discovering
+    if pretrain_model_key and not pretrain_vocab_key and not args.pretrain_vocab:
+        pretrain_vocab_key = pretrain_model_key.replace("model.pt", "vocab.pkl")
+        log.info(f"[auto] Using vocab: {pretrain_vocab_key}")
+
     # Pull fine-tune data from MinIO if --finetune-data-version was used
     ft_data_dict  = None
     resolved_version = args.data_version or ""
@@ -658,9 +675,9 @@ def main():
     results = run_finetuning(
         ft_cfg=ft_cfg,
         checkpoint_path=args.checkpoint,
-        pretrain_model_key=args.pretrain_model_key,
+        pretrain_model_key=pretrain_model_key,
         pretrain_vocab_path=args.pretrain_vocab,
-        pretrain_vocab_key=args.pretrain_vocab_key,
+        pretrain_vocab_key=pretrain_vocab_key,
         finetune_data_path=args.finetune_data,
         ft_data=ft_data_dict,
         data_version=resolved_version,

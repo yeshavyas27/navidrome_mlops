@@ -13,7 +13,6 @@ Optional:
     MLFLOW_TRACKING_URI   defaults to http://129.114.27.204:8000
     FINETUNE_DATA_VERSION pin a specific dataset version (e.g. v20260420-001232-live);
                           auto-detects latest for today's UTC date if unset
-    PRETRAIN_MODEL_KEY    pin a specific MinIO model key; auto-discovers latest pretrain otherwise
 
 Usage:
     cd train/
@@ -26,7 +25,6 @@ import subprocess
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from minio_store import get_client, get_latest_model_key
 
 
 def check_env():
@@ -34,18 +32,6 @@ def check_env():
     if missing:
         print(f"[SKIP] Missing env vars: {', '.join(missing)}")
         sys.exit(0)
-
-
-def discover_pretrain_keys(s3) -> tuple[str, str]:
-    """Return (model_key, vocab_key) for the latest pretrained model in MinIO."""
-    model_key = os.environ.get("PRETRAIN_MODEL_KEY") or get_latest_model_key(s3, run_type="pretrain")
-    if not model_key:
-        print("[FAIL] No pretrained model found in gru4rec-models/pretrain/")
-        sys.exit(1)
-    vocab_key = model_key.replace("model.pt", "vocab.pkl")
-    print(f"  pretrain model → {model_key}")
-    print(f"  pretrain vocab → {vocab_key}")
-    return model_key, vocab_key
 
 
 def run(cmd, label):
@@ -70,9 +56,6 @@ def main():
     print(f"MLflow:   {mlflow_uri}")
     print(f"MinIO:    {os.environ['MINIO_URL']}")
 
-    s3 = get_client()
-    model_key, vocab_key = discover_pretrain_keys(s3)
-
     # Build --finetune-data-version args: flag with no value → auto-detect today's latest
     version_args = (
         ["--finetune-data-version", dataset_version]
@@ -83,8 +66,7 @@ def main():
     run(
         [
             sys.executable, "finetune_gru4rec.py",
-            "--pretrain-model-key", model_key,
-            "--pretrain-vocab-key", vocab_key,
+            # no --pretrain-model-key: auto-discovers latest under artifacts/finetune/ → pretrain/
             *version_args,
             "--epochs",     "3",
             "--batch-size", "512",
