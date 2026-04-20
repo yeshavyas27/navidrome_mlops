@@ -99,7 +99,8 @@ cfg = {
     "full_eval_at_end":      True,       # NEW: run full eval on final epoch
 
     # ---- Temporal split ----
-    "test_fraction":         0.2,
+    "val_fraction":          0.1,        # carved from tail of train_seqs; used for early stopping
+    "test_fraction":         0.2,        # held out; evaluated once after training
 
     # ---- Hardware ----
     "device":                "cuda" if torch.cuda.is_available() else "cpu",
@@ -452,15 +453,22 @@ def build_sequences(interaction_df, item2idx: dict, user2idx: dict) -> list:
 
 
 def temporal_split(session_df, sequences: list, cfg: dict):
-    session_df = session_df.sort_values("timestamp")
-    split_idx  = int(len(session_df) * (1 - cfg["test_fraction"]))
-    train_ids  = set(session_df.iloc[:split_idx]["session_id"])
-    test_ids   = set(session_df.iloc[split_idx:]["session_id"])
+    session_df  = session_df.sort_values("timestamp")
+    n           = len(session_df)
+    val_frac    = cfg.get("val_fraction", 0.0)
+    test_frac   = cfg["test_fraction"]
+    train_end   = int(n * (1 - val_frac - test_frac))
+    val_end     = int(n * (1 - test_frac))
+
+    train_ids = set(session_df.iloc[:train_end]["session_id"])
+    val_ids   = set(session_df.iloc[train_end:val_end]["session_id"])
+    test_ids  = set(session_df.iloc[val_end:]["session_id"])
 
     train_seqs = [s for s in sequences if s["session_id"] in train_ids]
+    val_seqs   = [s for s in sequences if s["session_id"] in val_ids]
     test_seqs  = [s for s in sequences if s["session_id"] in test_ids]
-    log.info(f"Train: {len(train_seqs)} sessions | Test: {len(test_seqs)} sessions")
-    return train_seqs, test_seqs
+    log.info(f"Train: {len(train_seqs)} | Val: {len(val_seqs)} | Test: {len(test_seqs)} sessions")
+    return train_seqs, val_seqs, test_seqs
 
 
 # ============================================================
@@ -894,8 +902,15 @@ def prepare_data(cfg: dict) -> dict:
 def run_training(run_cfg: dict, data: dict, env_info: dict, is_tuning: bool = False) -> dict:
     num_items  = data["num_items"]
     num_users  = data["num_users"]
-    train_seqs = data["train_seqs"]
     test_seqs  = data["test_seqs"]
+
+    # Carve val from the tail of train_seqs (temporally latest sessions)
+    val_frac   = run_cfg.get("val_fraction", 0.1)
+    all_train  = data["train_seqs"]
+    split_at   = int(len(all_train) * (1 - val_frac))
+    train_seqs = all_train[:split_at]
+    val_seqs   = all_train[split_at:]
+    log.info(f"Train: {len(train_seqs)} | Val: {len(val_seqs)} | Test: {len(test_seqs)} sessions")
 
     device = torch.device(run_cfg["device"])
 
@@ -943,6 +958,7 @@ def run_training(run_cfg: dict, data: dict, env_info: dict, is_tuning: bool = Fa
             "num_items":        num_items,
             "num_users":        num_users,
             "train_sessions":   len(train_seqs),
+            "val_sessions":     len(val_seqs),
             "test_sessions":    len(test_seqs),
             "train_samples":    len(train_dataset),
             "model_parameters": n_params,
@@ -989,36 +1005,29 @@ def run_training(run_cfg: dict, data: dict, env_info: dict, is_tuning: bool = Fa
 
             is_last = (epoch == run_cfg["epochs"])
             if epoch % eval_every == 0 or is_last:
-                t_eval = time.time()
-                # Use subsampled eval except on last epoch (if configured)
+                t_eval     = time.time()
                 eval_limit = None if (is_last and run_cfg.get("full_eval_at_end", True)) else max_eval
-                results = evaluate(model, test_seqs, run_cfg, device, max_sessions=eval_limit)
-                eval_time = time.time() - t_eval
+                results    = evaluate(model, val_seqs, run_cfg, device, max_sessions=eval_limit)
+                eval_time  = time.time() - t_eval
 
                 top_n = run_cfg["top_n"]
                 mlflow.log_metrics({
-                    f"strict_HR{top_n}":         results["strict_HR"],
-                    f"strict_MRR{top_n}":        results["strict_MRR"],
-                    f"session_HR{top_n}":        results["session_HR"],
-                    f"session_MRR{top_n}":       results["session_MRR"],
-                    f"session_precision{top_n}": results["session_precision"],
-                    f"session_recall{top_n}":    results["session_recall"],
-                    "coverage":                  results["coverage"],
-                    "eval_time_sec":             round(eval_time, 2),
-                    "latency_mean_ms":           results["latency_mean_ms"],
-                    "latency_p50_ms":            results["latency_p50_ms"],
-                    "latency_p95_ms":            results["latency_p95_ms"],
-                    "latency_p99_ms":            results["latency_p99_ms"],
-                    "latency_max_ms":            results["latency_max_ms"],
-                    "throughput_qps":            results["throughput_qps"],
+                    f"val_strict_HR{top_n}":         results["strict_HR"],
+                    f"val_strict_MRR{top_n}":        results["strict_MRR"],
+                    f"val_session_HR{top_n}":         results["session_HR"],
+                    f"val_session_MRR{top_n}":        results["session_MRR"],
+                    f"val_session_precision{top_n}":  results["session_precision"],
+                    f"val_session_recall{top_n}":     results["session_recall"],
+                    "val_coverage":                   results["coverage"],
+                    "val_eval_time_sec":              round(eval_time, 2),
                 }, step=epoch)
 
                 if not is_tuning:
                     log.info(
-                        f"  Strict  HR{top_n}={results['strict_HR']:.4f}  MRR={results['strict_MRR']:.4f}\n"
-                        f"  Session HR{top_n}={results['session_HR']:.4f}  MRR={results['session_MRR']:.4f}  "
+                        f"  [val] Strict  HR{top_n}={results['strict_HR']:.4f}  MRR={results['strict_MRR']:.4f}\n"
+                        f"  [val] Session HR{top_n}={results['session_HR']:.4f}  MRR={results['session_MRR']:.4f}  "
                         f"P={results['session_precision']:.4f}  R={results['session_recall']:.4f}\n"
-                        f"  Eval: {eval_time:.1f}s  (subsampled={eval_limit is not None})"
+                        f"  Val eval: {eval_time:.1f}s  (subsampled={eval_limit is not None})"
                     )
 
                 if results["session_HR"] > best_session_hr:
@@ -1076,6 +1085,31 @@ def run_training(run_cfg: dict, data: dict, env_info: dict, is_tuning: bool = Fa
 
                 final_results = results
 
+        # ---- Final holdout evaluation on test set (run once, after training) ----
+        if best_state_dict is not None and not is_tuning:
+            raw_model = model.module if isinstance(model, nn.DataParallel) else model
+            raw_model.load_state_dict(best_state_dict)
+        t_test      = time.time()
+        test_results = evaluate(model, test_seqs, run_cfg, device, max_sessions=None)
+        test_eval_time = time.time() - t_test
+        top_n = run_cfg["top_n"]
+        mlflow.log_metrics({
+            f"test_strict_HR{top_n}":         test_results["strict_HR"],
+            f"test_strict_MRR{top_n}":        test_results["strict_MRR"],
+            f"test_session_HR{top_n}":         test_results["session_HR"],
+            f"test_session_MRR{top_n}":        test_results["session_MRR"],
+            f"test_session_precision{top_n}":  test_results["session_precision"],
+            f"test_session_recall{top_n}":     test_results["session_recall"],
+            "test_coverage":                   test_results["coverage"],
+            "test_eval_time_sec":              round(test_eval_time, 2),
+        })
+        if not is_tuning:
+            log.info(
+                f"  [test] Strict  HR{top_n}={test_results['strict_HR']:.4f}  MRR={test_results['strict_MRR']:.4f}\n"
+                f"  [test] Session HR{top_n}={test_results['session_HR']:.4f}  MRR={test_results['session_MRR']:.4f}  "
+                f"P={test_results['session_precision']:.4f}  R={test_results['session_recall']:.4f}"
+            )
+
         total_time    = time.time() - t_start
         gpu_hours     = (total_time / 3600) * max(env_info.get("gpu_count", 1), 1) if env_info.get("cuda_available") else 0
         final_gpu_mem = get_gpu_memory_stats()
@@ -1086,7 +1120,7 @@ def run_training(run_cfg: dict, data: dict, env_info: dict, is_tuning: bool = Fa
             "gpu_hours":           round(gpu_hours, 4),
             "avg_epoch_time_sec":  round(np.mean(epoch_times), 2),
             "peak_gpu_memory_mb":  final_gpu_mem["gpu_mem_peak_mb"],
-            "best_session_HR":     best_session_hr,
+            "best_val_session_HR": best_session_hr,
         })
 
         if not is_tuning:
@@ -1099,10 +1133,12 @@ def run_training(run_cfg: dict, data: dict, env_info: dict, is_tuning: bool = Fa
             )
 
     final_results.update({
-        "best_session_HR":     best_session_hr,
-        "total_train_seconds": total_time,
-        "gpu_hours":           gpu_hours,
-        "peak_gpu_memory_mb":  final_gpu_mem["gpu_mem_peak_mb"],
+        "best_val_session_HR":  best_session_hr,
+        "test_session_HR":      test_results["session_HR"],
+        "test_strict_HR":       test_results["strict_HR"],
+        "total_train_seconds":  total_time,
+        "gpu_hours":            gpu_hours,
+        "peak_gpu_memory_mb":   final_gpu_mem["gpu_mem_peak_mb"],
     })
     return final_results
 

@@ -91,6 +91,9 @@ FINETUNE_CFG = {
     "embedding_dropout":    0.25,
     "use_user_context":     False,
 
+    # ---- Val / Test split ----
+    "val_fraction":         0.1,        # carved from tail of train_seqs; used for early stopping
+
     # ---- Fine-tuning hyperparams ----
     "epochs":               10,
     "batch_size":           1024,
@@ -324,9 +327,15 @@ def run_finetuning(
     )
 
     # 3. Remap sequences to pretrained item indices
-    train_seqs = remap_sequences(ft_data["train_seqs"], ft_data["item2idx"], pretrain_item2idx)
-    test_seqs  = remap_sequences(ft_data["test_seqs"],  ft_data["item2idx"], pretrain_item2idx)
-    log.info(f"After remapping: {len(train_seqs)} train, {len(test_seqs)} test sequences")
+    all_train_seqs = remap_sequences(ft_data["train_seqs"], ft_data["item2idx"], pretrain_item2idx)
+    test_seqs      = remap_sequences(ft_data["test_seqs"],  ft_data["item2idx"], pretrain_item2idx)
+
+    # Carve val from the tail of train (temporally latest sessions)
+    val_frac   = ft_cfg.get("val_fraction", 0.1)
+    split_at   = int(len(all_train_seqs) * (1 - val_frac))
+    train_seqs = all_train_seqs[:split_at]
+    val_seqs   = all_train_seqs[split_at:]
+    log.info(f"After remapping: {len(train_seqs)} train, {len(val_seqs)} val, {len(test_seqs)} test sequences")
 
     if not train_seqs:
         raise RuntimeError(
@@ -400,6 +409,7 @@ def run_finetuning(
         mlflow.log_params({
             "num_items":           num_items,
             "train_sessions":      len(train_seqs),
+            "val_sessions":        len(val_seqs),
             "test_sessions":       len(test_seqs),
             "train_samples":       len(train_dataset),
             "pretrain_model_key":  pretrain_model_key or os.path.basename(checkpoint_path or ""),
@@ -443,28 +453,26 @@ def run_finetuning(
             if epoch % eval_every == 0 or is_last:
                 t_eval     = time.time()
                 eval_limit = None if (is_last and ft_cfg["full_eval_at_end"]) else max_eval
-                results    = evaluate(model, test_seqs, ft_cfg, device, max_sessions=eval_limit)
+                results    = evaluate(model, val_seqs, ft_cfg, device, max_sessions=eval_limit)
                 eval_time  = time.time() - t_eval
 
                 top_n = ft_cfg["top_n"]
                 mlflow.log_metrics(
                     {
-                        f"session_HR{top_n}":        results["session_HR"],
-                        f"session_MRR{top_n}":       results["session_MRR"],
-                        f"strict_HR{top_n}":         results["strict_HR"],
-                        f"strict_MRR{top_n}":        results["strict_MRR"],
-                        f"session_precision{top_n}": results["session_precision"],
-                        f"session_recall{top_n}":    results["session_recall"],
-                        "coverage":                  results["coverage"],
-                        "eval_time_sec":             round(eval_time, 2),
-                        "latency_mean_ms":           results["latency_mean_ms"],
-                        "latency_p95_ms":            results["latency_p95_ms"],
+                        f"val_session_HR{top_n}":        results["session_HR"],
+                        f"val_session_MRR{top_n}":       results["session_MRR"],
+                        f"val_strict_HR{top_n}":         results["strict_HR"],
+                        f"val_strict_MRR{top_n}":        results["strict_MRR"],
+                        f"val_session_precision{top_n}": results["session_precision"],
+                        f"val_session_recall{top_n}":    results["session_recall"],
+                        "val_coverage":                  results["coverage"],
+                        "val_eval_time_sec":             round(eval_time, 2),
                     },
                     step=epoch,
                 )
 
                 log.info(
-                    f"  Session HR{top_n}={results['session_HR']:.4f}  "
+                    f"  [val] Session HR{top_n}={results['session_HR']:.4f}  "
                     f"MRR={results['session_MRR']:.4f}  "
                     f"(eval {eval_time:.1f}s)"
                 )
@@ -473,7 +481,7 @@ def run_finetuning(
                     best_session_hr   = results["session_HR"]
                     epochs_no_improve = 0
                     best_state_dict   = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                    log.info(f"  -> New best session HR{top_n}: {best_session_hr:.4f}")
+                    log.info(f"  -> New best val session HR{top_n}: {best_session_hr:.4f}")
 
                     if MINIO_AVAILABLE:
                         _meta = {
@@ -516,21 +524,46 @@ def run_finetuning(
 
                 final_results = results
 
+        # ---- Final holdout evaluation on test set (run once, after training) ----
+        if best_state_dict is not None:
+            model.load_state_dict(best_state_dict)
+        t_test       = time.time()
+        test_results = evaluate(model, test_seqs, ft_cfg, device, max_sessions=None)
+        test_eval_time = time.time() - t_test
+        top_n = ft_cfg["top_n"]
+        mlflow.log_metrics({
+            f"test_session_HR{top_n}":        test_results["session_HR"],
+            f"test_session_MRR{top_n}":       test_results["session_MRR"],
+            f"test_strict_HR{top_n}":         test_results["strict_HR"],
+            f"test_strict_MRR{top_n}":        test_results["strict_MRR"],
+            f"test_session_precision{top_n}": test_results["session_precision"],
+            f"test_session_recall{top_n}":    test_results["session_recall"],
+            "test_coverage":                  test_results["coverage"],
+            "test_eval_time_sec":             round(test_eval_time, 2),
+        })
+        log.info(
+            f"  [test] Session HR{top_n}={test_results['session_HR']:.4f}  "
+            f"MRR={test_results['session_MRR']:.4f}"
+        )
+
         total_time = time.time() - t_start
         mlflow.log_metrics({
             "total_finetune_seconds": round(total_time, 2),
             "total_finetune_minutes": round(total_time / 60, 2),
-            "best_session_HR":        best_session_hr,
+            "best_val_session_HR":    best_session_hr,
             "epochs_trained":         epochs_trained,
         })
 
         log.info(
             f"\nDone. {total_time:.1f}s ({total_time/60:.1f} min) | "
-            f"Best HR{ft_cfg['top_n']}: {best_session_hr:.4f} | "
+            f"Best val HR{ft_cfg['top_n']}: {best_session_hr:.4f} | "
+            f"Test HR{ft_cfg['top_n']}: {test_results['session_HR']:.4f} | "
             f"MLflow run: {run.info.run_id}"
         )
 
-    final_results["best_session_HR"]       = best_session_hr
+    final_results["best_val_session_HR"]   = best_session_hr
+    final_results["test_session_HR"]        = test_results["session_HR"]
+    final_results["test_strict_HR"]         = test_results["strict_HR"]
     final_results["total_finetune_seconds"] = total_time
     final_results["mlflow_run_id"]          = run.info.run_id
     return final_results
@@ -633,7 +666,8 @@ def main():
         data_version=resolved_version,
     )
 
-    print(f"\nbest_session_HR@{ft_cfg['top_n']}: {results['best_session_HR']:.4f}")
+    print(f"\nbest_val_session_HR@{ft_cfg['top_n']}: {results['best_val_session_HR']:.4f}")
+    print(f"test_session_HR@{ft_cfg['top_n']}:     {results['test_session_HR']:.4f}")
     print(f"mlflow_run_id: {results['mlflow_run_id']}")
 
 
