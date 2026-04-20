@@ -133,27 +133,35 @@ FINETUNE_CFG = {
 DATASET_BUCKET = "navidrome-datasets"
 
 
-def _latest_dataset_version(s3, date_str: str) -> str:
+def _latest_dataset_version(s3, max_days_back: int = 7) -> str:
     """
-    List versions under navidrome-datasets/datasets/ matching date_str (YYYYMMDD).
-    Returns the lexicographically latest version (highest HHMMSS suffix).
+    Find the latest dataset version folder in navidrome-datasets/datasets/.
+
+    Starts from today's UTC date and walks backwards up to max_days_back days,
+    looking for folders named v{YYYYMMDD}-{HHMMSS}-live. Returns the
+    lexicographically latest version on the most recent date that has data.
     """
-    prefix    = f"datasets/v{date_str}"
+    from datetime import timedelta
     paginator = s3.get_paginator("list_objects_v2")
-    versions  = set()
-    for page in paginator.paginate(Bucket=DATASET_BUCKET, Prefix=prefix, Delimiter="/"):
-        for cp in page.get("CommonPrefixes", []):
-            # cp["Prefix"] e.g. "datasets/v20260420-001232-live/"
-            part = cp["Prefix"].rstrip("/").split("/")[-1]
-            versions.add(part)
-    if not versions:
-        raise RuntimeError(
-            f"No dataset versions found for date {date_str} in {DATASET_BUCKET}/datasets/. "
-            f"Pass --finetune-data-version explicitly if the date prefix differs."
-        )
-    latest = sorted(versions)[-1]
-    log.info(f"[minio] Latest dataset version for {date_str}: {latest}")
-    return latest
+
+    for days_back in range(max_days_back + 1):
+        date_str = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y%m%d")
+        prefix   = f"datasets/v{date_str}"
+        versions = set()
+        for page in paginator.paginate(Bucket=DATASET_BUCKET, Prefix=prefix, Delimiter="/"):
+            for cp in page.get("CommonPrefixes", []):
+                part = cp["Prefix"].rstrip("/").split("/")[-1]
+                versions.add(part)
+        if versions:
+            latest = sorted(versions)[-1]
+            log.info(f"[minio] Latest dataset version (date={date_str}): {latest}")
+            return latest
+        log.info(f"[minio] No dataset found for {date_str}, checking previous day ...")
+
+    raise RuntimeError(
+        f"No dataset versions found in {DATASET_BUCKET}/datasets/ "
+        f"within the last {max_days_back} days. Pass --finetune-data-version explicitly."
+    )
 
 
 def prepare_finetune_data(cfg: dict) -> dict:
@@ -175,8 +183,7 @@ def prepare_finetune_data(cfg: dict) -> dict:
     os.makedirs(cache_dir, exist_ok=True)
 
     if not version:
-        date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
-        version  = _latest_dataset_version(s3, date_str)
+        version = _latest_dataset_version(s3)
 
     def download(fname):
         local = os.path.join(cache_dir, f"{version}_{fname}")
@@ -586,16 +593,13 @@ def parse_args():
     voc.add_argument("--pretrain-vocab-key", help="MinIO key for vocab.pkl. Derived from model key automatically when auto-discovering.")
     voc.add_argument("--pretrain-vocab",     help="Local pretrained vocab pickle (item2idx)")
 
-    # Fine-tune data source — Swift version tag OR local pickle (mutually exclusive)
-    ft_data_src = p.add_mutually_exclusive_group(required=True)
+    # Fine-tune data source — explicit version, local pickle, or auto-detect (default)
+    ft_data_src = p.add_mutually_exclusive_group(required=False)
     ft_data_src.add_argument(
         "--finetune-data-version",
-        help="MinIO dataset version to pull (e.g. v20260420-001232-live). "
-             "Downloads train_sequences.pkl, test_sequences.pkl, item2idx.json, user2idx.json "
-             "from navidrome-datasets/datasets/{version}/. "
-             "If omitted (use flag with no value), auto-detects the latest version for today's UTC date.",
-        nargs="?",
-        const="",   # flag present but no value → auto-detect
+        help="Pin a specific MinIO dataset version (e.g. v20260420-001232-live). "
+             "If omitted entirely, auto-detects: starts from today's UTC date and walks "
+             "backwards up to 7 days until a v{YYYYMMDD}-{HHMMSS}-live folder is found.",
     )
     ft_data_src.add_argument(
         "--finetune-data",
@@ -664,10 +668,10 @@ def main():
         pretrain_vocab_key = pretrain_model_key.replace("model.pt", "vocab.pkl")
         log.info(f"[auto] Using vocab: {pretrain_vocab_key}")
 
-    # Pull fine-tune data from MinIO if --finetune-data-version was used
-    ft_data_dict  = None
+    # Pull fine-tune data from MinIO unless a local pickle was given
+    ft_data_dict     = None
     resolved_version = args.data_version or ""
-    if args.finetune_data_version is not None:
+    if not args.finetune_data:
         ft_cfg["finetune_dataset_version"] = args.finetune_data_version or ""
         ft_data_dict     = prepare_finetune_data(ft_cfg)
         resolved_version = args.data_version or ft_data_dict.get("version", "")

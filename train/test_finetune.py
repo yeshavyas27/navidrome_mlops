@@ -1,8 +1,10 @@
 """
-Integration test for finetune_gru4rec.py and eval_gru4rec.py.
+Integration test for finetune_gru4rec.py.
 
-Pulls real data and model artifacts from MinIO, then runs the full
-fine-tuning and eval pipeline end-to-end.
+Pulls real data and model artifacts from MinIO fully autonomously:
+  - Model:   latest under artifacts/finetune/ (falls back to pretrain/)
+  - Dataset: latest v{YYYYMMDD}-{HHMMSS}-live from navidrome-datasets,
+             starting from today and walking backwards up to 7 days
 
 Requires env vars:
     MINIO_URL       e.g. http://129.114.27.204:9000
@@ -11,8 +13,6 @@ Requires env vars:
 
 Optional:
     MLFLOW_TRACKING_URI   defaults to http://129.114.27.204:8000
-    FINETUNE_DATA_VERSION pin a specific dataset version (e.g. v20260420-001232-live);
-                          auto-detects latest for today's UTC date if unset
 
 Usage:
     cd train/
@@ -48,26 +48,19 @@ def run(cmd, label):
 def main():
     check_env()
 
-    mlflow_uri         = os.environ.get("MLFLOW_TRACKING_URI", "http://129.114.27.204:8000")
-    dataset_version    = os.environ.get("FINETUNE_DATA_VERSION", "")  # empty = auto-detect
-    tmpdir             = tempfile.mkdtemp(prefix="gru4rec_integ_")
+    mlflow_uri = os.environ.get("MLFLOW_TRACKING_URI", "http://129.114.27.204:8000")
+    tmpdir     = tempfile.mkdtemp(prefix="gru4rec_integ_")
 
     print(f"Temp dir: {tmpdir}")
     print(f"MLflow:   {mlflow_uri}")
     print(f"MinIO:    {os.environ['MINIO_URL']}")
-
-    # Build --finetune-data-version args: flag with no value → auto-detect today's latest
-    version_args = (
-        ["--finetune-data-version", dataset_version]
-        if dataset_version
-        else ["--finetune-data-version"]   # nargs="?" with no value → auto-detect
-    )
+    print("Model:    auto-discover latest under artifacts/finetune/ → pretrain/")
+    print("Dataset:  auto-detect latest v{YYYYMMDD}-{HHMMSS}-live, today → up to 7 days back")
 
     run(
         [
             sys.executable, "finetune_gru4rec.py",
-            # no --pretrain-model-key: auto-discovers latest under artifacts/finetune/ → pretrain/
-            *version_args,
+            # no model/data args: both fully auto-detected from MinIO
             "--epochs",     "3",
             "--batch-size", "512",
             "--lr",         "1e-4",
