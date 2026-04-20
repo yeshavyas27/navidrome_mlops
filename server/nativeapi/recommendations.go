@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -87,14 +89,20 @@ func (api *Router) getRecommendations() http.HandlerFunc {
 		mfRepo := api.ds.MediaFile(ctx)
 		songs, err := mfRepo.GetAll(model.QueryOptions{Max: 10, Sort: "random"})
 
-		// Collect only non-empty MbzRecordingIDs. If nothing comes back (e.g.
-		// Navidrome's library has no 30Music-tagged tracks yet), we still call
-		// the serving container with an empty list — serving has a popularity
-		// cold-start fallback so the user sees something instead of an empty page.
+		// Extract 30Music track IDs from the filename path.
+		// Files are named like "audio_complete/3012335.mp3" where 3012335 is the
+		// 30Music track ID that matches the model vocabulary.
+		// Falls back to MbzRecordingID if available.
 		var trackIDs []string
 		if err == nil {
 			for _, mf := range songs {
-				if mf.MbzRecordingID != "" {
+				// Try to extract integer ID from filename (e.g. "3012335" from "audio_complete/3012335.mp3")
+				base := filepath.Base(mf.Path)
+				ext := filepath.Ext(base)
+				nameWithoutExt := strings.TrimSuffix(base, ext)
+				if nameWithoutExt != "" && nameWithoutExt != base {
+					trackIDs = append(trackIDs, nameWithoutExt)
+				} else if mf.MbzRecordingID != "" {
 					trackIDs = append(trackIDs, mf.MbzRecordingID)
 				}
 			}
