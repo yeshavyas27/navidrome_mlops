@@ -241,18 +241,23 @@ def download_metadata(s3, run_type: str, run_id: str,
 # DISCOVERY — find latest model
 # ============================================================
 
-def get_latest_model_key(s3, run_type: str = "finetune", bucket: str = None) -> str | None:
-    """Return the MinIO key of the most recently uploaded model.pt for run_type.
+def get_latest_model_key(s3, run_type: str = "finetune", bucket: str = None,
+                         max_days_back: int = 30) -> str | None:
+    """Return the MinIO key of the latest model.pt for run_type.
 
-    Searches finetune/ first; falls back to pretrain/ if nothing found and
-    run_type was 'finetune'.  Returns None if the bucket is empty.
+    Walks backwards from today's UTC date (format: YYYY-MM-DD), checking each
+    date folder under {run_type}/{date}/ until a model.pt is found.
+    If run_type is 'finetune' and nothing is found, falls back to 'pretrain/'.
 
     Key layout: {run_type}/{YYYY-MM-DD}/{run_id}/model.pt
     """
-    bucket = bucket or os.environ.get("MINIO_BUCKET", DEFAULT_BUCKET)
+    from datetime import timedelta
+    bucket    = bucket or os.environ.get("MINIO_BUCKET", DEFAULT_BUCKET)
+    paginator = s3.get_paginator("list_objects_v2")
 
-    def _latest_in(prefix):
-        paginator = s3.get_paginator("list_objects_v2")
+    def _latest_in_date(date_str: str) -> str | None:
+        """Find latest model.pt (by LastModified) under {run_type}/{date_str}/."""
+        prefix   = f"{run_type}/{date_str}/"
         best_key, best_ts = None, None
         for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
             for obj in page.get("Contents", []):
@@ -262,17 +267,20 @@ def get_latest_model_key(s3, run_type: str = "finetune", bucket: str = None) -> 
                         best_ts  = obj["LastModified"]
         return best_key
 
-    key = _latest_in(f"{run_type}/")
-    if key is None and run_type == "finetune":
-        log.info("[minio] No finetune model found, falling back to pretrain/")
-        key = _latest_in("pretrain/")
+    for days_back in range(max_days_back + 1):
+        date_str = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        key = _latest_in_date(date_str)
+        if key:
+            log.info(f"[minio] Latest {run_type} model (date={date_str}): {key}")
+            return key
+        log.info(f"[minio] No {run_type} model found for {date_str}, checking previous day ...")
 
-    if key:
-        log.info(f"[minio] Latest {run_type} model: {key}")
-    else:
-        log.warning(f"[minio] No model.pt found under {run_type}/ in bucket {bucket}")
+    if run_type == "finetune":
+        log.info("[minio] No finetune model found in last {max_days_back} days, falling back to pretrain/")
+        return get_latest_model_key(s3, run_type="pretrain", bucket=bucket, max_days_back=max_days_back)
 
-    return key
+    log.warning(f"[minio] No model.pt found under {run_type}/ in bucket {bucket}")
+    return None
 
 
 # ============================================================
