@@ -12,9 +12,11 @@ import {
   CircularProgress,
   Box,
   Chip,
+  IconButton,
 } from '@material-ui/core'
 import { makeStyles } from '@material-ui/core/styles'
 import MusicNoteIcon from '@material-ui/icons/MusicNote'
+import PlayArrowIcon from '@material-ui/icons/PlayArrow'
 
 const useStyles = makeStyles((theme) => ({
   root: {
@@ -57,6 +59,7 @@ const RecommendationList = () => {
   const [error, setError] = useState(null)
   const [modelVersion, setModelVersion] = useState('')
   const [generatedAt, setGeneratedAt] = useState('')
+  const [nowPlayingId, setNowPlayingId] = useState(null)
   useEffect(() => {
     const fetchRecommendations = async () => {
       try {
@@ -145,9 +148,27 @@ const RecommendationList = () => {
                         className={classes.score}
                       />
                     )}
+                    <IconButton
+                      aria-label="play"
+                      onClick={() => setNowPlayingId(rec.id || rec.track_id)}
+                    >
+                      <PlayArrowIcon />
+                    </IconButton>
                   </ListItem>
                 ))}
               </List>
+
+              {nowPlayingId && (
+                <Box mt={2}>
+                  <audio
+                    key={nowPlayingId}
+                    src={`/api/recommendation/play/${nowPlayingId}`}
+                    controls
+                    autoPlay
+                    style={{ width: '100%' }}
+                  />
+                </Box>
+              )}
             </>
           )}
 
