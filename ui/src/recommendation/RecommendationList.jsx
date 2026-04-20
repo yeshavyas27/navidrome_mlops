@@ -12,12 +12,9 @@ import {
   CircularProgress,
   Box,
   Chip,
-  IconButton,
 } from '@material-ui/core'
 import { makeStyles } from '@material-ui/core/styles'
 import MusicNoteIcon from '@material-ui/icons/MusicNote'
-import AlbumIcon from '@material-ui/icons/Album'
-import PlayArrowIcon from '@material-ui/icons/PlayArrow'
 
 const useStyles = makeStyles((theme) => ({
   root: {
@@ -60,8 +57,6 @@ const RecommendationList = () => {
   const [error, setError] = useState(null)
   const [modelVersion, setModelVersion] = useState('')
   const [generatedAt, setGeneratedAt] = useState('')
-  const [nowPlayingId, setNowPlayingId] = useState(null)
-
   useEffect(() => {
     const fetchRecommendations = async () => {
       try {
@@ -125,48 +120,35 @@ const RecommendationList = () => {
           )}
 
           {recommendations.length > 0 && (
-            <List>
-              {recommendations.map((rec, index) => (
-                <ListItem key={rec.id || index} className={classes.listItem}>
-                  <ListItemAvatar>
-                    <Avatar className={classes.avatar}>
-                      <AlbumIcon />
-                    </Avatar>
-                  </ListItemAvatar>
-                  <ListItemText
-                    primary={rec.title}
-                    secondary={`${rec.artist}${rec.album ? ` — ${rec.album}` : ''}`}
-                  />
-                  {rec.score != null && (
-                    <Chip
-                      label={rec.score.toFixed(1)}
-                      size="small"
-                      color="primary"
-                      variant="outlined"
-                      className={classes.score}
+            <>
+              <Typography variant="body2" color="textSecondary" gutterBottom>
+                Top {Math.min(recommendations.length, 10)} recommendations based on your listening history
+              </Typography>
+              <List>
+                {recommendations.slice(0, 10).map((rec, index) => (
+                  <ListItem key={rec.id || rec.track_id || index} className={classes.listItem}>
+                    <ListItemAvatar>
+                      <Avatar className={classes.avatar}>
+                        {index + 1}
+                      </Avatar>
+                    </ListItemAvatar>
+                    <ListItemText
+                      primary={rec.title || `Track ${rec.track_id || rec.id}`}
+                      secondary={rec.artist || 'Unknown Artist'}
                     />
-                  )}
-                  <IconButton
-                    aria-label="play"
-                    onClick={() => setNowPlayingId(rec.id || rec.track_id)}
-                  >
-                    <PlayArrowIcon />
-                  </IconButton>
-                </ListItem>
-              ))}
-            </List>
-          )}
-
-          {nowPlayingId && (
-            <Box mt={2}>
-              <audio
-                key={nowPlayingId}
-                src={`/api/recommendation/play/${nowPlayingId}`}
-                controls
-                autoPlay
-                style={{ width: '100%' }}
-              />
-            </Box>
+                    {rec.score != null && (
+                      <Chip
+                        label={`Score: ${rec.score.toFixed(1)}`}
+                        size="small"
+                        color="primary"
+                        variant="outlined"
+                        className={classes.score}
+                      />
+                    )}
+                  </ListItem>
+                ))}
+              </List>
+            </>
           )}
 
           {modelVersion && (
