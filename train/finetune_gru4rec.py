@@ -53,8 +53,6 @@ import argparse
 import tempfile
 from datetime import datetime, timezone
 
-import requests
-
 import torch
 import mlflow
 from torch.utils.data import DataLoader
@@ -119,43 +117,76 @@ FINETUNE_CFG = {
     "mlflow_tracking_uri":  os.environ.get("MLFLOW_TRACKING_URI", "http://129.114.27.204:8000"),
     "mlflow_experiment":    "30music-session-recommendation-finetune",
 
-    # ---- Cache / Swift ----
+    # ---- Cache / MinIO dataset ----
     "cache_dir":            ".cache_gru4rec",
-    "finetune_dataset_version": "",   # e.g. "v20260419-finetune-001"; if set, data is pulled from Swift
+    "finetune_dataset_version": "",   # e.g. "v20260420-001232-live"; if empty, auto-detects latest for today
 }
 
 
 # ============================================================
-# SWIFT DATA LOADING
+# MINIO DATASET LOADING
 # ============================================================
+
+DATASET_BUCKET = "navidrome-datasets"
+
+
+def _latest_dataset_version(s3, date_str: str) -> str:
+    """
+    List versions under navidrome-datasets/datasets/ matching date_str (YYYYMMDD).
+    Returns the lexicographically latest version (highest HHMMSS suffix).
+    """
+    prefix    = f"datasets/v{date_str}"
+    paginator = s3.get_paginator("list_objects_v2")
+    versions  = set()
+    for page in paginator.paginate(Bucket=DATASET_BUCKET, Prefix=prefix, Delimiter="/"):
+        for cp in page.get("CommonPrefixes", []):
+            # cp["Prefix"] e.g. "datasets/v20260420-001232-live/"
+            part = cp["Prefix"].rstrip("/").split("/")[-1]
+            versions.add(part)
+    if not versions:
+        raise RuntimeError(
+            f"No dataset versions found for date {date_str} in {DATASET_BUCKET}/datasets/. "
+            f"Pass --finetune-data-version explicitly if the date prefix differs."
+        )
+    latest = sorted(versions)[-1]
+    log.info(f"[minio] Latest dataset version for {date_str}: {latest}")
+    return latest
+
 
 def prepare_finetune_data(cfg: dict) -> dict:
     """
-    Downloads fine-tune sequences from the Swift bucket.
+    Downloads fine-tune sequences from the MinIO navidrome-datasets bucket.
 
-    Swift URL:
-        https://chi.uc.chameleoncloud.org:7480/swift/v1/AUTH_7c0a7a1952e44c94aa75cae1ff5dc9b4/navidrome-bucket-proj05/datasets/{version}/
-    Expected files: train_sequences.pkl, test_sequences.pkl, item2idx.json, user2idx.json
+    Bucket layout:
+        navidrome-datasets/datasets/{version}/train_sequences.pkl
+        navidrome-datasets/datasets/{version}/test_sequences.pkl
+        navidrome-datasets/datasets/{version}/item2idx.json
+        navidrome-datasets/datasets/{version}/user2idx.json
+
+    If cfg["finetune_dataset_version"] is empty, auto-detects the latest
+    version for today's UTC date (format: v{YYYYMMDD}-{HHMMSS}-live).
     """
-    version   = cfg["finetune_dataset_version"]
-    base_url  = (
-        f"https://chi.uc.chameleoncloud.org:7480/swift/v1/"
-        f"AUTH_7c0a7a1952e44c94aa75cae1ff5dc9b4/navidrome-bucket-proj05/datasets/{version}"
-    )
+    s3        = get_client()
+    version   = cfg.get("finetune_dataset_version", "")
     cache_dir = cfg.get("cache_dir", ".cache_gru4rec")
     os.makedirs(cache_dir, exist_ok=True)
+
+    if not version:
+        date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+        version  = _latest_dataset_version(s3, date_str)
 
     def download(fname):
         local = os.path.join(cache_dir, f"{version}_{fname}")
         if os.path.exists(local):
             log.info(f"[cache] Using cached {fname}")
             return local
-        log.info(f"Downloading {fname} from Swift ...")
-        r = requests.get(f"{base_url}/{fname}", timeout=300, stream=True)
-        r.raise_for_status()
+        key = f"datasets/{version}/{fname}"
+        log.info(f"Downloading {fname} from MinIO (key: {key}) ...")
+        buf = io.BytesIO()
+        s3.download_fileobj(DATASET_BUCKET, key, buf)
+        buf.seek(0)
         with open(local, "wb") as fh:
-            for chunk in r.iter_content(chunk_size=8192):
-                fh.write(chunk)
+            fh.write(buf.read())
         log.info(f"Downloaded {fname} ({os.path.getsize(local)/1e6:.1f} MB)")
         return local
 
@@ -197,6 +228,7 @@ def prepare_finetune_data(cfg: dict) -> dict:
         "test_seqs":  test_seqs,
         "num_items":  len(item2idx),
         "num_users":  len(user2idx),
+        "version":    version,
     }
 
 
@@ -525,9 +557,12 @@ def parse_args():
     ft_data_src = p.add_mutually_exclusive_group(required=True)
     ft_data_src.add_argument(
         "--finetune-data-version",
-        help="Swift dataset version to pull (e.g. v20260419-finetune-001). "
+        help="MinIO dataset version to pull (e.g. v20260420-001232-live). "
              "Downloads train_sequences.pkl, test_sequences.pkl, item2idx.json, user2idx.json "
-             "from the Swift bucket.",
+             "from navidrome-datasets/datasets/{version}/. "
+             "If omitted (use flag with no value), auto-detects the latest version for today's UTC date.",
+        nargs="?",
+        const="",   # flag present but no value → auto-detect
     )
     ft_data_src.add_argument(
         "--finetune-data",
@@ -579,11 +614,13 @@ def main():
 
     log.info(json.dumps(ft_cfg, indent=2, default=str))
 
-    # Pull fine-tune data from Swift if a version tag was given
-    ft_data_dict = None
-    if args.finetune_data_version:
-        ft_cfg["finetune_dataset_version"] = args.finetune_data_version
-        ft_data_dict = prepare_finetune_data(ft_cfg)
+    # Pull fine-tune data from MinIO if --finetune-data-version was used
+    ft_data_dict  = None
+    resolved_version = args.data_version or ""
+    if args.finetune_data_version is not None:
+        ft_cfg["finetune_dataset_version"] = args.finetune_data_version or ""
+        ft_data_dict     = prepare_finetune_data(ft_cfg)
+        resolved_version = args.data_version or ft_data_dict.get("version", "")
 
     results = run_finetuning(
         ft_cfg=ft_cfg,
@@ -593,7 +630,7 @@ def main():
         pretrain_vocab_key=args.pretrain_vocab_key,
         finetune_data_path=args.finetune_data,
         ft_data=ft_data_dict,
-        data_version=args.data_version or args.finetune_data_version or "",
+        data_version=resolved_version,
     )
 
     print(f"\nbest_session_HR@{ft_cfg['top_n']}: {results['best_session_HR']:.4f}")
