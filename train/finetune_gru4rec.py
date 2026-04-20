@@ -509,11 +509,13 @@ def run_finetuning(
                             "git_sha":               env_info.get("git_sha", ""),
                         }
                         try:
+                            _vocab = {"item2idx": pretrain_item2idx}
                             _keys = push_run_artifacts(
                                 state_dict=best_state_dict,
                                 run_type="finetune",
                                 run_id=run.info.run_id,
                                 metadata=_meta,
+                                vocab=_vocab,
                             )
                             mlflow.set_tags({
                                 "minio_model_key":    _keys["model_key"],
@@ -665,8 +667,22 @@ def main():
 
     # Derive vocab key from model key when auto-discovering
     if pretrain_model_key and not pretrain_vocab_key and not args.pretrain_vocab:
-        pretrain_vocab_key = pretrain_model_key.replace("model.pt", "vocab.pkl")
-        log.info(f"[auto] Using vocab: {pretrain_vocab_key}")
+        candidate = pretrain_model_key.replace("model.pt", "vocab.pkl")
+        # Check if vocab exists at the derived path (finetune models may not have one)
+        try:
+            s3 = s3 if "s3" in dir() else get_client()
+            bucket = os.environ.get("MINIO_BUCKET", "artifacts")
+            s3.head_object(Bucket=bucket, Key=candidate)
+            pretrain_vocab_key = candidate
+            log.info(f"[auto] Using vocab: {pretrain_vocab_key}")
+        except Exception:
+            # vocab.pkl not at finetune path — fall back to latest pretrain vocab
+            log.info(f"[auto] vocab.pkl not found at {candidate}, falling back to latest pretrain vocab")
+            pretrain_key = get_latest_model_key(s3, run_type="pretrain")
+            if not pretrain_key:
+                raise RuntimeError("No pretrain model found to source vocab.pkl from.")
+            pretrain_vocab_key = pretrain_key.replace("model.pt", "vocab.pkl")
+            log.info(f"[auto] Using pretrain vocab: {pretrain_vocab_key}")
 
     # Pull fine-tune data from MinIO unless a local pickle was given
     ft_data_dict     = None
