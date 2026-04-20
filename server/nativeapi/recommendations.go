@@ -87,16 +87,20 @@ func (api *Router) getRecommendations() http.HandlerFunc {
 		mfRepo := api.ds.MediaFile(ctx)
 		songs, err := mfRepo.GetAll(model.QueryOptions{Max: 10, Sort: "random"})
 
+		// Collect only non-empty MbzRecordingIDs. If nothing comes back (e.g.
+		// Navidrome's library has no 30Music-tagged tracks yet), we still call
+		// the serving container with an empty list — serving has a popularity
+		// cold-start fallback so the user sees something instead of an empty page.
 		var trackIDs []string
 		if err == nil {
 			for _, mf := range songs {
-				trackIDs = append(trackIDs, mf.MbzRecordingID)
+				if mf.MbzRecordingID != "" {
+					trackIDs = append(trackIDs, mf.MbzRecordingID)
+				}
 			}
 		}
-
-		if len(trackIDs) == 0 {
-			respondWithEmptyRecommendations(w, user.UserName)
-			return
+		if trackIDs == nil {
+			trackIDs = []string{}
 		}
 
 		// Call serving container: POST /recommend-by-tracks
