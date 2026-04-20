@@ -5,10 +5,10 @@ Connects via boto3 (S3-compatible). Configure with env vars:
     MINIO_URL       e.g. http://minio:9000
     MINIO_USER      access key
     MINIO_PASSWORD  secret key
-    MINIO_BUCKET    (optional) defaults to "gru4rec-models"
+    MINIO_BUCKET    (optional) defaults to "artifacts"
 
 Bucket layout:
-    gru4rec-models/
+    artifacts/
       pretrain/{YYYY-MM-DD}/{mlflow_run_id}/
         model.pt        — model weights (state_dict)
         vocab.pkl       — item2idx saved at training time
@@ -34,7 +34,7 @@ from botocore.exceptions import ClientError
 
 log = logging.getLogger(__name__)
 
-DEFAULT_BUCKET = "gru4rec-models"
+DEFAULT_BUCKET = "artifacts"
 
 
 # ============================================================
