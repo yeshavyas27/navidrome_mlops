@@ -59,7 +59,6 @@ const RecommendationList = () => {
   const [error, setError] = useState(null)
   const [modelVersion, setModelVersion] = useState('')
   const [generatedAt, setGeneratedAt] = useState('')
-  const [nowPlayingId, setNowPlayingId] = useState(null)
   useEffect(() => {
     const fetchRecommendations = async () => {
       try {
@@ -150,7 +149,10 @@ const RecommendationList = () => {
                     )}
                     <IconButton
                       aria-label="play"
-                      onClick={() => setNowPlayingId(rec.id || rec.track_id)}
+                      onClick={() => {
+                        // Navigate to the song in Navidrome's built-in player
+                        window.location.hash = `/song/${rec.id}/show`
+                      }}
                     >
                       <PlayArrowIcon />
                     </IconButton>
@@ -158,17 +160,7 @@ const RecommendationList = () => {
                 ))}
               </List>
 
-              {nowPlayingId && (
-                <Box mt={2}>
-                  <audio
-                    key={nowPlayingId}
-                    src={`/api/recommendation/play/${nowPlayingId}`}
-                    controls
-                    autoPlay
-                    style={{ width: '100%' }}
-                  />
-                </Box>
-              )}
+
             </>
           )}
 
