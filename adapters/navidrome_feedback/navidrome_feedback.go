@@ -49,6 +49,8 @@ type feedbackScrobbler struct {
 	ds          model.DataStore
 	feedbackURL string
 	httpClient  *http.Client
+	posMu       sync.Mutex
+	lastPos     map[string]int // key: userID+"_"+trackID
 }
 
 func newFeedbackScrobbler(ds model.DataStore) scrobbler.Scrobbler {
@@ -61,6 +63,7 @@ func newFeedbackScrobbler(ds model.DataStore) scrobbler.Scrobbler {
 		ds:          ds,
 		feedbackURL: url,
 		httpClient:  &http.Client{Timeout: 5 * time.Second},
+		lastPos:     make(map[string]int),
 	}
 }
 
@@ -68,7 +71,10 @@ func (f *feedbackScrobbler) IsAuthorized(_ context.Context, _ string) bool {
 	return true
 }
 
-func (f *feedbackScrobbler) NowPlaying(_ context.Context, _ string, _ *model.MediaFile, _ int) error {
+func (f *feedbackScrobbler) NowPlaying(_ context.Context, userID string, t *model.MediaFile, position int) error {
+	f.posMu.Lock()
+	f.lastPos[userID+"_"+t.ID] = position
+	f.posMu.Unlock()
 	return nil
 }
 
@@ -89,8 +95,24 @@ func (f *feedbackScrobbler) Scrobble(ctx context.Context, userID string, s scrob
 		log.Debug(ctx, "New ML session started", "user", userID)
 	}
 
+	posKey := userID + "_" + s.MediaFile.ID
+	f.posMu.Lock()
+	pos := f.lastPos[posKey]
+	delete(f.lastPos, posKey)
+	f.posMu.Unlock()
+
+	var ratio float64
+	if s.MediaFile.Duration > 0 && pos > 0 {
+		ratio = float64(pos) / float64(s.MediaFile.Duration)
+		if ratio > 1.0 {
+			ratio = 1.0
+		}
+	} else {
+		ratio = 1.0
+	}
+
 	entry.TrackIDs   = append(entry.TrackIDs, s.MediaFile.ID)
-	entry.PlayRatios = append(entry.PlayRatios, 1.0)
+	entry.PlayRatios = append(entry.PlayRatios, ratio)
 	entry.LastPlay   = now
 
 	if len(entry.TrackIDs) >= 3 {
