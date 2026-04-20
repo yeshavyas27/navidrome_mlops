@@ -59,6 +59,9 @@ func (api *Router) routes() http.Handler {
 	// Public
 	api.RX(r, "/translation", newTranslationRepository, false)
 
+	// Public: recommendation play endpoint (audio tag can't send auth headers)
+	r.Get("/recommendation/play/{trackId}", api.playRecommendedTrack())
+
 	// Protected
 	r.Group(func(r chi.Router) {
 		r.Use(server.Authenticator(api.ds))

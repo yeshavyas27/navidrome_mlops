@@ -62,7 +62,8 @@ type serveRecommendResponse struct {
 func (api *Router) addRecommendationRoute(r chi.Router) {
 	r.Route("/recommendation", func(r chi.Router) {
 		r.Get("/", api.getRecommendations())
-		r.Get("/play/{trackId}", api.playRecommendedTrack())
+		// Note: /play/{trackId} is registered as a public route in native_api.go
+		// because HTML5 <audio> tags cannot send auth headers.
 	})
 }
 
