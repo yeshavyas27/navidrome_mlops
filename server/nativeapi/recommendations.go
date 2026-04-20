@@ -48,6 +48,8 @@ type serveRecommendResponse struct {
 		Rank    int     `json:"rank"`
 		ItemIdx int     `json:"item_idx"`
 		TrackID string  `json:"track_id"`
+		Title   string  `json:"title"`
+		Artist  string  `json:"artist"`
 		Score   float64 `json:"score"`
 	} `json:"recommendations"`
 	ModelVersion       string  `json:"model_version"`
@@ -58,6 +60,7 @@ type serveRecommendResponse struct {
 func (api *Router) addRecommendationRoute(r chi.Router) {
 	r.Route("/recommendation", func(r chi.Router) {
 		r.Get("/", api.getRecommendations())
+		r.Get("/play/{trackId}", api.playRecommendedTrack())
 	})
 }
 
@@ -79,13 +82,15 @@ func (api *Router) getRecommendations() http.HandlerFunc {
 
 		// Get some tracks from the library to use as seed for recommendations.
 		// Uses random tracks — in production this would use the user's play history.
+		// At 30Music ingest, the 30Music track_id is stored in MbzRecordingID,
+		// which is what the model's vocab is keyed on.
 		mfRepo := api.ds.MediaFile(ctx)
 		songs, err := mfRepo.GetAll(model.QueryOptions{Max: 10, Sort: "random"})
 
 		var trackIDs []string
 		if err == nil {
 			for _, mf := range songs {
-				trackIDs = append(trackIDs, mf.ID)
+				trackIDs = append(trackIDs, mf.MbzRecordingID)
 			}
 		}
 
@@ -135,13 +140,21 @@ func (api *Router) getRecommendations() http.HandlerFunc {
 
 		var recs []RecommendationItem
 		for _, rec := range serveResp.Recommendations {
+			title := rec.Title
+			if title == "" {
+				title = "Track " + rec.TrackID
+			}
+			artist := rec.Artist
+			if artist == "" {
+				artist = "Unknown"
+			}
 			recs = append(recs, RecommendationItem{
 				ID:      rec.TrackID,
 				TrackID: rec.TrackID,
 				Score:   rec.Score,
 				Rank:    rec.Rank,
-				Title:   "Track " + rec.TrackID,
-				Artist:  "Recommended",
+				Title:   title,
+				Artist:  artist,
 			})
 		}
 
@@ -154,6 +167,53 @@ func (api *Router) getRecommendations() http.HandlerFunc {
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(uiResp) //nolint:errcheck
+	}
+}
+
+// playRecommendedTrack proxies to the serving container's /play/{track_id}
+// endpoint, which returns a 302 redirect to a presigned Swift URL. We forward
+// that redirect to the browser so the HTML5 <audio> tag streams directly
+// from Swift (the Navidrome Go process is not in the audio byte path).
+func (api *Router) playRecommendedTrack() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+
+		if !conf.Server.EnableRecommendations {
+			http.Error(w, "Recommendations are disabled", http.StatusNotFound)
+			return
+		}
+		serviceURL := conf.Server.RecommendationServiceURL
+		if serviceURL == "" {
+			http.Error(w, "Recommendation service not configured", http.StatusServiceUnavailable)
+			return
+		}
+
+		trackID := chi.URLParam(r, "trackId")
+		if trackID == "" {
+			http.Error(w, "missing trackId", http.StatusBadRequest)
+			return
+		}
+
+		// Don't follow the redirect — we want to forward it to the browser.
+		client := &http.Client{
+			Timeout: 130 * time.Second, // > serving's per-track yt-dlp timeout
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
+		resp, err := client.Get(serviceURL + "/play/" + trackID)
+		if err != nil {
+			log.Error(ctx, "play proxy failed", "track_id", trackID, err)
+			http.Error(w, "play proxy failed", http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		if loc := resp.Header.Get("Location"); loc != "" {
+			w.Header().Set("Location", loc)
+		}
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
 	}
 }
 

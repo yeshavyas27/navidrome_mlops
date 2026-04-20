@@ -95,35 +95,48 @@ func (f *feedbackScrobbler) Scrobble(ctx context.Context, userID string, s scrob
 		log.Debug(ctx, "New ML session started", "user", userID)
 	}
 
+	// ID mapping: the ML training pipeline keys on 30Music integer track_ids,
+	// not Navidrome's internal UUIDs. At 30Music catalog ingest time we store
+	// the 30Music id in MbzRecordingID; if it's empty, the track isn't part
+	// of the recommendable corpus and the scrobble would just pollute training
+	// data with unresolvable UUIDs.
+	if s.MediaFile.MbzRecordingID == "" {
+		log.Debug(ctx, "Scrobble skipped: track has no MbzRecordingID",
+			"user", userID, "media_file_id", s.MediaFile.ID)
+		return nil
+	}
+
+	// Compute playratio from the last NowPlaying position; fall back to 1.0
+	// when we have no position (e.g. scrobbler fires on a track we never saw
+	// NowPlaying for, or duration is missing).
 	posKey := userID + "_" + s.MediaFile.ID
 	f.posMu.Lock()
 	pos := f.lastPos[posKey]
 	delete(f.lastPos, posKey)
 	f.posMu.Unlock()
 
-	var ratio float64
+	ratio := 1.0
 	if s.MediaFile.Duration > 0 && pos > 0 {
 		ratio = float64(pos) / float64(s.MediaFile.Duration)
 		if ratio > 1.0 {
 			ratio = 1.0
 		}
-	} else {
-		ratio = 1.0
 	}
 
-	entry.TrackIDs   = append(entry.TrackIDs, s.MediaFile.ID)
+	entry.TrackIDs   = append(entry.TrackIDs, s.MediaFile.MbzRecordingID)
 	entry.PlayRatios = append(entry.PlayRatios, ratio)
 	entry.LastPlay   = now
 
 	if len(entry.TrackIDs) >= 3 {
-		go f.sendSession(userID, entry)
+		entryCopy := *entry
+		go f.sendSession(ctx, userID, &entryCopy)
 		delete(buf.sessions, userID)
 	}
 
 	return nil
 }
 
-func (f *feedbackScrobbler) sendSession(userID string, entry *sessionEntry) {
+func (f *feedbackScrobbler) sendSession(ctx context.Context, userID string, entry *sessionEntry) {
 	sessionID := fmt.Sprintf("%s_%d", userID, entry.StartTime.Unix())
 	payload := feedbackPayload{
 		SessionID:      sessionID,
@@ -136,7 +149,7 @@ func (f *feedbackScrobbler) sendSession(userID string, entry *sessionEntry) {
 
 	body, err := json.Marshal(payload)
 	if err != nil {
-		log.Error(context.Background(), "Failed to marshal ML session", "user", userID, err)
+		log.Error(ctx, "Failed to marshal ML session", "user", userID, err)
 		return
 	}
 
@@ -146,12 +159,12 @@ func (f *feedbackScrobbler) sendSession(userID string, entry *sessionEntry) {
 		bytes.NewReader(body),
 	)
 	if err != nil {
-		log.Error(context.Background(), "Failed to send ML session", "user", userID, err)
+		log.Error(ctx, "Failed to send ML session", "user", userID, err)
 		return
 	}
 	defer resp.Body.Close()
 
-	log.Info(context.Background(), "ML session sent",
+	log.Info(ctx, "ML session sent",
 		"user", userID,
 		"tracks", len(entry.TrackIDs),
 		"status", resp.StatusCode,
