@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Masterminds/squirrel"
 	"github.com/go-chi/chi/v5"
 	"github.com/navidrome/navidrome/conf"
 	"github.com/navidrome/navidrome/log"
@@ -112,13 +113,15 @@ func (api *Router) getRecommendations() http.HandlerFunc {
 			trackIDs = []string{}
 		}
 
-		// Call serving container: POST /recommend-by-tracks
+		// Ask for many recommendations so we can filter to tracks in our library.
+		// The model knows 745k tracks but we only have ~2k. Request top 200
+		// then filter to tracks that exist locally.
 		reqBody := serveRecommendRequest{
 			SessionID:       "navidrome-ui-" + user.UserName,
 			UserID:          user.UserName,
 			TrackIDs:        trackIDs,
 			ExcludeTrackIDs: []string{},
-			TopN:            20,
+			TopN:            100,
 		}
 		jsonBody, _ := json.Marshal(reqBody)
 
@@ -151,23 +154,36 @@ func (api *Router) getRecommendations() http.HandlerFunc {
 			return
 		}
 
+		// Filter recommendations to only tracks that exist in our library.
+		// Look up metadata (title, artist) from Navidrome's database by matching
+		// the recommended track ID to the filename in the media_file path.
 		var recs []RecommendationItem
+		rank := 0
 		for _, rec := range serveResp.Recommendations {
-			title := rec.Title
-			if title == "" {
-				title = "Track " + rec.TrackID
+			if rank >= 10 {
+				break
 			}
-			artist := rec.Artist
-			if artist == "" {
-				artist = "Unknown"
+
+			// Search for this track in Navidrome's library by filename pattern
+			pathPattern := "%" + rec.TrackID + ".mp3"
+			matches, err := mfRepo.GetAll(model.QueryOptions{
+				Max:    1,
+				Filters: squirrel.Like{"media_file.path": pathPattern},
+			})
+			if err != nil || len(matches) == 0 {
+				continue // Skip tracks not in our library
 			}
+
+			mf := matches[0]
+			rank++
 			recs = append(recs, RecommendationItem{
-				ID:      rec.TrackID,
+				ID:      mf.ID,
 				TrackID: rec.TrackID,
 				Score:   rec.Score,
-				Rank:    rec.Rank,
-				Title:   title,
-				Artist:  artist,
+				Rank:    rank,
+				Title:   mf.Title,
+				Artist:  mf.Artist,
+				Album:   mf.Album,
 			})
 		}
 
