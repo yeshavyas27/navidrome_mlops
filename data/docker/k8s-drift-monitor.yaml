@@ -14,7 +14,7 @@ spec:
             image: python:3.10-slim
             command: ["/bin/sh", "-c"]
             args:
-              - "pip install pandas pyarrow mlflow numpy python-swiftclient requests -q &&
+              - "pip install pandas pyarrow mlflow numpy python-swiftclient python-keystoneclient psycopg2-binary requests -q &&
                  python /app/monitor_drift.py"
             env:
             - name: MLFLOW_TRACKING_URI
