@@ -51,6 +51,7 @@ import pickle
 import logging
 import argparse
 import tempfile
+from collections import Counter
 from datetime import datetime, timezone
 
 import torch
@@ -123,7 +124,246 @@ FINETUNE_CFG = {
     # ---- Cache / MinIO dataset ----
     "cache_dir":            ".cache_gru4rec",
     "finetune_dataset_version": "",   # e.g. "v20260420-001232-live"; if empty, auto-detects latest for today
+
+    # ---- Safeguarding thresholds ----
+    "safeguard_max_session_length_multiplier": 10,   # sessions longer than avg * this are flagged
+    "safeguard_item_freq_threshold":           0.05, # single item > 5% of all interactions triggers warning
+    "safeguard_regression_threshold":          0.05, # HR drop > this vs previous best triggers warning
+    "safeguard_popularity_top_pct":            0.10, # top-N% items used for popularity bias metric
 }
+
+
+# ============================================================
+# SAFEGUARDING UTILITIES
+# ============================================================
+
+def check_data_quality(train_seqs: list, test_seqs: list, cfg: dict) -> dict:
+    """
+    Run lightweight data-quality / data-poisoning checks before training.
+
+    Checks:
+      1. Suspiciously long sessions  — could indicate injected fake sessions
+         designed to over-represent certain items.
+      2. Item frequency spike        — a single item appearing in an unusually
+         large fraction of interactions may signal catalog manipulation.
+
+    Results are returned as a dict so they can be logged to MLflow and do not
+    raise exceptions by default; the caller decides whether to abort.
+    """
+    report = {"warnings": [], "passed": True}
+
+    all_seqs = train_seqs + test_seqs
+    if not all_seqs:
+        report["warnings"].append("No sequences to check.")
+        report["passed"] = False
+        return report
+
+    # --- Check 1: session length outliers ---
+    lengths = [len(s["item_idxs"]) for s in all_seqs]
+    avg_len = sum(lengths) / len(lengths)
+    multiplier = cfg.get("safeguard_max_session_length_multiplier", 10)
+    outlier_threshold = avg_len * multiplier
+    outliers = [l for l in lengths if l > outlier_threshold]
+    if outliers:
+        msg = (
+            f"{len(outliers)} sessions exceed {multiplier}x average length "
+            f"(avg={avg_len:.1f}, threshold={outlier_threshold:.1f}, "
+            f"max_found={max(outliers)})"
+        )
+        log.warning(f"[safeguard:data-quality] {msg}")
+        report["warnings"].append(msg)
+        report["passed"] = False
+
+    # --- Check 2: item frequency spike ---
+    all_items = [i for s in train_seqs for i in s["item_idxs"]]
+    if all_items:
+        item_counts = Counter(all_items)
+        most_common_item, most_common_count = item_counts.most_common(1)[0]
+        freq = most_common_count / len(all_items)
+        threshold = cfg.get("safeguard_item_freq_threshold", 0.05)
+        if freq > threshold:
+            msg = (
+                f"Item {most_common_item} appears in {freq:.1%} of all train interactions "
+                f"(threshold={threshold:.1%}) — possible data poisoning or catalog error"
+            )
+            log.warning(f"[safeguard:data-quality] {msg}")
+            report["warnings"].append(msg)
+            report["passed"] = False
+
+    if report["passed"]:
+        log.info("[safeguard:data-quality] All checks passed.")
+
+    return report
+
+
+def log_popularity_bias(train_seqs: list, cfg: dict) -> dict:
+    """
+    Compute a popularity-bias metric over the training sequences.
+
+    Splits the item catalog into a "top-N%" popularity tier and a long-tail tier
+    based on interaction counts in the training data, then reports what fraction
+    of total interactions fall into the top tier.
+
+    A high and rising value across successive fine-tune runs indicates a feedback
+    loop where the model is reinforcing already-popular items.
+
+    Returns a dict of metrics suitable for mlflow.log_metrics().
+    """
+    all_items = [i for s in train_seqs for i in s["item_idxs"]]
+    if not all_items:
+        return {}
+
+    item_counts   = Counter(all_items)
+    sorted_items  = sorted(item_counts, key=item_counts.get, reverse=True)
+    n             = len(sorted_items)
+    top_pct       = cfg.get("safeguard_popularity_top_pct", 0.10)
+    top_k         = max(1, int(n * top_pct))
+    top_items     = set(sorted_items[:top_k])
+
+    top_interactions  = sum(item_counts[i] for i in top_items)
+    total_interactions = len(all_items)
+    top_interaction_share = top_interactions / total_interactions
+
+    metrics = {
+        "train_unique_items":              n,
+        "train_total_interactions":        total_interactions,
+        f"train_top{int(top_pct*100)}pct_items":            top_k,
+        f"train_top{int(top_pct*100)}pct_interaction_share": round(top_interaction_share, 4),
+    }
+
+    log.info(
+        f"[safeguard:popularity-bias] Top {top_pct:.0%} items ({top_k}) account for "
+        f"{top_interaction_share:.1%} of train interactions."
+    )
+    if top_interaction_share > 0.80:
+        log.warning(
+            "[safeguard:popularity-bias] >80% of interactions concentrated in top "
+            f"{top_pct:.0%} of items — high popularity skew detected."
+        )
+    return metrics
+
+
+def push_safeguard_metrics_to_prometheus(
+    hr_delta: float,
+    popularity_share: float,
+    data_quality_passed: bool,
+    data_version: str,
+    mlflow_run_id: str,
+    run_type: str = "finetune",
+) -> None:
+    """
+    Push the three safeguarding signals to a Prometheus push gateway.
+
+    Requires PROMETHEUS_PUSHGATEWAY_URL env var (e.g. http://pushgateway:9091).
+    Silently skips if the env var is absent or prometheus_client is not installed.
+
+    Metrics:
+      gru4rec_safeguard_hr_delta             — HR change vs previous best model
+      gru4rec_safeguard_popularity_share     — fraction of interactions in top-10% items
+      gru4rec_safeguard_data_quality_passed  — 1.0 if all checks passed, 0.0 otherwise
+    """
+    pushgateway_url = os.environ.get("PROMETHEUS_PUSHGATEWAY_URL", "")
+    if not pushgateway_url:
+        return
+
+    try:
+        from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
+    except ImportError:
+        log.warning("[prometheus] prometheus_client not installed — skipping metric push.")
+        return
+
+    registry    = CollectorRegistry()
+    label_names = ["run_type", "data_version", "mlflow_run_id"]
+
+    g_hr_delta = Gauge(
+        "gru4rec_safeguard_hr_delta",
+        "HR change vs previous best fine-tuned model",
+        label_names, registry=registry,
+    )
+    g_pop_share = Gauge(
+        "gru4rec_safeguard_popularity_share",
+        "Fraction of training interactions in top-10% most popular items",
+        label_names, registry=registry,
+    )
+    g_dq = Gauge(
+        "gru4rec_safeguard_data_quality_passed",
+        "1 if all data-quality checks passed, 0 otherwise",
+        label_names, registry=registry,
+    )
+
+    lv = [run_type, data_version, mlflow_run_id]
+    g_hr_delta.labels(*lv).set(hr_delta)
+    g_pop_share.labels(*lv).set(popularity_share)
+    g_dq.labels(*lv).set(1.0 if data_quality_passed else 0.0)
+
+    try:
+        push_to_gateway(pushgateway_url, job="gru4rec_finetune", registry=registry)
+        log.info(f"[prometheus] Safeguard metrics pushed to {pushgateway_url}")
+    except Exception as e:
+        log.warning(f"[prometheus] Push gateway failed — {e}")
+
+
+def check_performance_regression(
+    new_hr: float,
+    s3,
+    cfg: dict,
+    mlflow_run=None,
+) -> dict:
+    """
+    Compare the new model's test HR against the best previously pushed model.
+
+    If the drop exceeds cfg["safeguard_regression_threshold"], a warning is
+    logged and the 'performance_regression' tag is set on the active MLflow run.
+
+    Returns a dict with the comparison details for transparency.
+    """
+    threshold = cfg.get("safeguard_regression_threshold", 0.05)
+    result    = {"regression_detected": False, "prev_hr": None, "hr_delta": None}
+
+    if s3 is None:
+        log.info("[safeguard:regression] MinIO not available — skipping regression check.")
+        return result
+
+    try:
+        latest_key = get_latest_model_key(s3, run_type="finetune")
+        if not latest_key:
+            log.info("[safeguard:regression] No previous model found — skipping regression check.")
+            return result
+
+        meta_key = latest_key.replace("model.pt", "metadata.json")
+        bucket   = os.environ.get("MINIO_BUCKET", "artifacts")
+        buf      = io.BytesIO()
+        s3.download_fileobj(bucket, meta_key, buf)
+        prev_meta = json.loads(buf.getvalue())
+        prev_hr   = prev_meta.get("session_HR", 0.0)
+        delta     = new_hr - prev_hr
+
+        result["prev_hr"]   = prev_hr
+        result["hr_delta"]  = round(delta, 6)
+
+        log.info(
+            f"[safeguard:regression] New HR={new_hr:.4f}  |  "
+            f"Prev best HR={prev_hr:.4f}  |  Delta={delta:+.4f}"
+        )
+
+        if delta < -threshold:
+            msg = (
+                f"Performance regression: new HR={new_hr:.4f} vs prev HR={prev_hr:.4f} "
+                f"(drop={abs(delta):.4f} > threshold={threshold})"
+            )
+            log.warning(f"[safeguard:regression] {msg}")
+            result["regression_detected"] = True
+            if mlflow_run is not None:
+                mlflow.set_tag("performance_regression", "true")
+                mlflow.set_tag("performance_regression_detail", msg)
+        else:
+            if mlflow_run is not None:
+                mlflow.set_tag("performance_regression", "false")
+
+    except Exception as e:
+        log.warning(f"[safeguard:regression] Could not complete regression check: {e}")
+
+    return result
 
 
 # ============================================================
@@ -337,6 +577,15 @@ def run_finetuning(
     all_train_seqs = remap_sequences(ft_data["train_seqs"], ft_data["item2idx"], pretrain_item2idx)
     test_seqs      = remap_sequences(ft_data["test_seqs"],  ft_data["item2idx"], pretrain_item2idx)
 
+    # ------------------------------------------------------------------ #
+    # SAFEGUARD LAYER 1 — Data quality / poisoning checks                 #
+    # Run immediately after remapping, before any training begins.        #
+    # This is the most critical check: the auto-discovery pipeline pulls  #
+    # the latest MinIO dataset without human review, making it the most   #
+    # vulnerable entry point.                                              #
+    # ------------------------------------------------------------------ #
+    dq_report = check_data_quality(all_train_seqs, test_seqs, ft_cfg)
+
     # Carve val from the tail of train (temporally latest sessions)
     val_frac   = ft_cfg.get("val_fraction", 0.1)
     split_at   = int(len(all_train_seqs) * (1 - val_frac))
@@ -349,6 +598,12 @@ def run_finetuning(
             "No training sequences after remapping. "
             "Ensure fine-tune data comes from the same 30Music catalog."
         )
+
+    # ------------------------------------------------------------------ #
+    # SAFEGUARD LAYER 3 — Popularity bias baseline                        #
+    # Compute before training so the pre-training distribution is known.  #
+    # ------------------------------------------------------------------ #
+    popularity_metrics = log_popularity_bias(train_seqs, ft_cfg)
 
     # 4. Load pretrained model weights
     num_users = ft_data.get("num_users", 1)
@@ -424,6 +679,23 @@ def run_finetuning(
         })
         mlflow.set_tags({"model_type": "GRU4Rec-InBatch-Finetune", "run_type": "finetune"})
         log_environment_to_mlflow(env_info)
+
+        # ------------------------------------------------------------------ #
+        # Log all safeguarding metadata upfront for full traceability         #
+        # ------------------------------------------------------------------ #
+        mlflow.log_params({
+            "safeguard_data_version": data_version or (ft_data.get("version", "") if ft_data else ""),
+        })
+        mlflow.log_metrics(popularity_metrics)
+        mlflow.set_tag(
+            "safeguard_data_quality_passed",
+            "true" if dq_report["passed"] else "false"
+        )
+        if dq_report["warnings"]:
+            mlflow.set_tag(
+                "safeguard_data_quality_warnings",
+                " | ".join(dq_report["warnings"])[:500]   # MLflow tag limit
+            )
 
         t_start = time.time()
 
@@ -505,8 +777,9 @@ def run_finetuning(
                             "epoch":                 epoch,
                             "pretrain_source":       pretrain_model_key or checkpoint_path or "",
                             "finetune_data_version": data_version or (os.path.basename(finetune_data_path) if finetune_data_path else ""),
-                            "gpu_name":              env_info.get("gpu_name", ""),
-                            "git_sha":               env_info.get("git_sha", ""),
+                            # Safeguarding metadata persisted alongside every model artifact
+                            "safeguard_data_quality_passed":      dq_report["passed"],
+                            "safeguard_data_quality_warnings":    dq_report["warnings"],
                         }
                         try:
                             _vocab = {"item2idx": pretrain_item2idx}
@@ -555,6 +828,39 @@ def run_finetuning(
             f"MRR={test_results['session_MRR']:.4f}"
         )
 
+        # ------------------------------------------------------------------ #
+        # SAFEGUARD LAYER 4 — Performance regression check                    #
+        # Run after final test evaluation, before returning results.          #
+        # Compares new model against the previously pushed best to catch      #
+        # silent degradation from corrupted or drifted training data.         #
+        # ------------------------------------------------------------------ #
+        regression_result = check_performance_regression(
+            new_hr=test_results["session_HR"],
+            s3=s3,
+            cfg=ft_cfg,
+            mlflow_run=run,
+        )
+        mlflow.log_metrics({
+            "safeguard_prev_best_hr": regression_result["prev_hr"] or 0.0,
+            "safeguard_hr_delta":     regression_result["hr_delta"] or 0.0,
+        })
+
+        # ------------------------------------------------------------------ #
+        # Push the three operational safeguard signals to Prometheus so they  #
+        # can be trended and alerted on in Grafana across fine-tune runs.     #
+        # No-ops when PROMETHEUS_PUSHGATEWAY_URL is unset.                    #
+        # ------------------------------------------------------------------ #
+        _top_pct    = ft_cfg.get("safeguard_popularity_top_pct", 0.10)
+        _pop_key    = f"train_top{int(_top_pct * 100)}pct_interaction_share"
+        _pop_share  = popularity_metrics.get(_pop_key, 0.0)
+        push_safeguard_metrics_to_prometheus(
+            hr_delta            = regression_result["hr_delta"] or 0.0,
+            popularity_share    = _pop_share,
+            data_quality_passed = dq_report["passed"],
+            data_version        = data_version or (ft_data.get("version", "") if ft_data else ""),
+            mlflow_run_id       = run.info.run_id,
+        )
+
         total_time = time.time() - t_start
         mlflow.log_metrics({
             "total_finetune_seconds": round(total_time, 2),
@@ -569,12 +875,19 @@ def run_finetuning(
             f"Test HR{ft_cfg['top_n']}: {test_results['session_HR']:.4f} | "
             f"MLflow run: {run.info.run_id}"
         )
+        if regression_result["regression_detected"]:
+            log.warning(
+                f"[safeguard] Regression flag set — review MLflow run {run.info.run_id} "
+                f"before promoting this model to serving."
+            )
 
-    final_results["best_val_session_HR"]   = best_session_hr
-    final_results["test_session_HR"]        = test_results["session_HR"]
-    final_results["test_strict_HR"]         = test_results["strict_HR"]
-    final_results["total_finetune_seconds"] = total_time
-    final_results["mlflow_run_id"]          = run.info.run_id
+    final_results["best_val_session_HR"]        = best_session_hr
+    final_results["test_session_HR"]             = test_results["session_HR"]
+    final_results["test_strict_HR"]              = test_results["strict_HR"]
+    final_results["total_finetune_seconds"]      = total_time
+    final_results["mlflow_run_id"]               = run.info.run_id
+    final_results["safeguard_data_quality"]      = dq_report
+    final_results["safeguard_regression"]        = regression_result
     return final_results
 
 
@@ -620,6 +933,14 @@ def parse_args():
     p.add_argument("--top-n",      type=int,   default=FINETUNE_CFG["top_n"])
     p.add_argument("--patience",   type=int,   default=FINETUNE_CFG["patience"])
 
+    # Safeguarding thresholds (overridable at runtime)
+    p.add_argument("--safeguard-item-freq-threshold",  type=float,
+                   default=FINETUNE_CFG["safeguard_item_freq_threshold"],
+                   help="Single-item interaction share that triggers a poisoning warning (default 0.05)")
+    p.add_argument("--safeguard-regression-threshold", type=float,
+                   default=FINETUNE_CFG["safeguard_regression_threshold"],
+                   help="HR drop vs previous best that triggers a regression warning (default 0.05)")
+
     # Infra
     p.add_argument("--device",       default=FINETUNE_CFG["device"])
     p.add_argument("--mlflow-uri",   default=FINETUNE_CFG["mlflow_tracking_uri"])
@@ -649,6 +970,9 @@ def main():
         "mlflow_tracking_uri": args.mlflow_uri,
         "mlflow_experiment":   args.experiment,
         "cache_dir":           args.cache_dir,
+        # Safeguarding thresholds
+        "safeguard_item_freq_threshold":   args.safeguard_item_freq_threshold,
+        "safeguard_regression_threshold":  args.safeguard_regression_threshold,
     })
 
     log.info(json.dumps(ft_cfg, indent=2, default=str))
@@ -706,6 +1030,8 @@ def main():
     print(f"\nbest_val_session_HR@{ft_cfg['top_n']}: {results['best_val_session_HR']:.4f}")
     print(f"test_session_HR@{ft_cfg['top_n']}:     {results['test_session_HR']:.4f}")
     print(f"mlflow_run_id: {results['mlflow_run_id']}")
+    print(f"safeguard_data_quality_passed: {results['safeguard_data_quality']['passed']}")
+    print(f"safeguard_regression_detected: {results['safeguard_regression']['regression_detected']}")
 
 
 if __name__ == "__main__":
