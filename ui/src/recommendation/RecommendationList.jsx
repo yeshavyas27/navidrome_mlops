@@ -12,11 +12,9 @@ import {
   CircularProgress,
   Box,
   Chip,
-  IconButton,
 } from '@material-ui/core'
 import { makeStyles } from '@material-ui/core/styles'
 import MusicNoteIcon from '@material-ui/icons/MusicNote'
-import PlayArrowIcon from '@material-ui/icons/PlayArrow'
 
 const useStyles = makeStyles((theme) => ({
   root: {
@@ -147,15 +145,7 @@ const RecommendationList = () => {
                         className={classes.score}
                       />
                     )}
-                    <IconButton
-                      aria-label="play"
-                      onClick={() => {
-                        // Navigate to the song in Navidrome's built-in player
-                        window.location.hash = `/song/${rec.id}/show`
-                      }}
-                    >
-                      <PlayArrowIcon />
-                    </IconButton>
+
                   </ListItem>
                 ))}
               </List>

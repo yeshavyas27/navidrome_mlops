@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -95,15 +97,17 @@ func (f *feedbackScrobbler) Scrobble(ctx context.Context, userID string, s scrob
 		log.Debug(ctx, "New ML session started", "user", userID)
 	}
 
-	// ID mapping: the ML training pipeline keys on 30Music integer track_ids,
-	// not Navidrome's internal UUIDs. At 30Music catalog ingest time we store
-	// the 30Music id in MbzRecordingID; if it's empty, the track isn't part
-	// of the recommendable corpus and the scrobble would just pollute training
-	// data with unresolvable UUIDs.
-	if s.MediaFile.MbzRecordingID == "" {
-		log.Debug(ctx, "Scrobble skipped: track has no MbzRecordingID",
-			"user", userID, "media_file_id", s.MediaFile.ID)
-		return nil
+	// ID mapping: extract the 30Music integer track_id from the filename.
+	// Files are named like "audio_complete/3012335.mp3" where 3012335 is the
+	// 30Music track ID. Fall back to MbzRecordingID, then Navidrome UUID.
+	trackID := s.MediaFile.MbzRecordingID
+	if trackID == "" {
+		base := filepath.Base(s.MediaFile.Path)
+		ext := filepath.Ext(base)
+		trackID = strings.TrimSuffix(base, ext)
+	}
+	if trackID == "" {
+		trackID = s.MediaFile.ID
 	}
 
 	// Compute playratio from the last NowPlaying position; fall back to 1.0
@@ -123,7 +127,7 @@ func (f *feedbackScrobbler) Scrobble(ctx context.Context, userID string, s scrob
 		}
 	}
 
-	entry.TrackIDs   = append(entry.TrackIDs, s.MediaFile.MbzRecordingID)
+	entry.TrackIDs   = append(entry.TrackIDs, trackID)
 	entry.PlayRatios = append(entry.PlayRatios, ratio)
 	entry.LastPlay   = now
 
