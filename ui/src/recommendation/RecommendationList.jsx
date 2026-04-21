@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react'
-import { useTranslate, useDataProvider, Title } from 'react-admin'
-
+import { useTranslate, Title, useDataProvider } from 'react-admin'
+import { useDispatch } from 'react-redux'
 import {
   Card,
   CardContent,
@@ -18,7 +18,7 @@ import {
 import { makeStyles } from '@material-ui/core/styles'
 import MusicNoteIcon from '@material-ui/icons/MusicNote'
 import PlayArrowIcon from '@material-ui/icons/PlayArrow'
-import subsonic from '../subsonic'
+import { playTracks } from '../actions'
 
 const useStyles = makeStyles((theme) => ({
   root: {
@@ -56,12 +56,14 @@ const useStyles = makeStyles((theme) => ({
 const RecommendationList = () => {
   const classes = useStyles()
   const translate = useTranslate()
+  const dispatch = useDispatch()
+  const dataProvider = useDataProvider()
   const [recommendations, setRecommendations] = useState([])
-  const [nowPlayingId, setNowPlayingId] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [modelVersion, setModelVersion] = useState('')
   const [generatedAt, setGeneratedAt] = useState('')
+
   useEffect(() => {
     const fetchRecommendations = async () => {
       try {
@@ -89,6 +91,18 @@ const RecommendationList = () => {
 
     fetchRecommendations()
   }, [])
+
+  const handlePlay = async (rec) => {
+    try {
+      // Fetch the full song record from Navidrome's API
+      const { data } = await dataProvider.getOne('song', { id: rec.id })
+      // Build the data object that playTracks expects
+      const songData = { [data.id]: data }
+      dispatch(playTracks(songData, [data.id], data.id))
+    } catch (e) {
+      console.error('Failed to play track:', e)
+    }
+  }
 
   if (loading) {
     return (
@@ -152,28 +166,13 @@ const RecommendationList = () => {
                     )}
                     <IconButton
                       aria-label="play"
-                      onClick={() => setNowPlayingId(rec.id)}
+                      onClick={() => handlePlay(rec)}
                     >
                       <PlayArrowIcon />
                     </IconButton>
                   </ListItem>
                 ))}
               </List>
-
-              {nowPlayingId && (
-                <Box mt={2} p={2} style={{ backgroundColor: '#f5f5f5', borderRadius: 8 }}>
-                  <Typography variant="body2" color="textSecondary" gutterBottom>
-                    Now Playing: {recommendations.find((r) => r.id === nowPlayingId)?.title || 'Unknown'}
-                  </Typography>
-                  <audio
-                    key={nowPlayingId}
-                    src={subsonic.streamUrl(nowPlayingId)}
-                    controls
-                    autoPlay
-                    style={{ width: '100%' }}
-                  />
-                </Box>
-              )}
             </>
           )}
 
