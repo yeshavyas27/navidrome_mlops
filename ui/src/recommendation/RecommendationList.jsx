@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react'
 import { useTranslate, useDataProvider, Title } from 'react-admin'
-import { useDispatch } from 'react-redux'
+
 import {
   Card,
   CardContent,
@@ -18,7 +18,7 @@ import {
 import { makeStyles } from '@material-ui/core/styles'
 import MusicNoteIcon from '@material-ui/icons/MusicNote'
 import PlayArrowIcon from '@material-ui/icons/PlayArrow'
-import { playTracks } from '../actions'
+import subsonic from '../subsonic'
 
 const useStyles = makeStyles((theme) => ({
   root: {
@@ -56,8 +56,8 @@ const useStyles = makeStyles((theme) => ({
 const RecommendationList = () => {
   const classes = useStyles()
   const translate = useTranslate()
-  const dispatch = useDispatch()
   const [recommendations, setRecommendations] = useState([])
+  const [nowPlayingId, setNowPlayingId] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [modelVersion, setModelVersion] = useState('')
@@ -152,18 +152,7 @@ const RecommendationList = () => {
                     )}
                     <IconButton
                       aria-label="play"
-                      onClick={() => {
-                        const songData = {
-                          [rec.id]: {
-                            id: rec.id,
-                            title: rec.title,
-                            artist: rec.artist,
-                            album: rec.album || '',
-                            duration: 30,
-                          },
-                        }
-                        dispatch(playTracks(songData, [rec.id], rec.id))
-                      }}
+                      onClick={() => setNowPlayingId(rec.id)}
                     >
                       <PlayArrowIcon />
                     </IconButton>
@@ -171,7 +160,20 @@ const RecommendationList = () => {
                 ))}
               </List>
 
-
+              {nowPlayingId && (
+                <Box mt={2} p={2} style={{ backgroundColor: '#f5f5f5', borderRadius: 8 }}>
+                  <Typography variant="body2" color="textSecondary" gutterBottom>
+                    Now Playing: {recommendations.find((r) => r.id === nowPlayingId)?.title || 'Unknown'}
+                  </Typography>
+                  <audio
+                    key={nowPlayingId}
+                    src={subsonic.streamUrl(nowPlayingId)}
+                    controls
+                    autoPlay
+                    style={{ width: '100%' }}
+                  />
+                </Box>
+              )}
             </>
           )}
 
