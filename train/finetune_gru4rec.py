@@ -297,7 +297,7 @@ def push_safeguard_metrics_to_prometheus(
     g_dq.labels(*lv).set(1.0 if data_quality_passed else 0.0)
 
     try:
-        push_to_gateway(pushgateway_url, job="gru4rec_finetune", registry=registry)
+        push_to_gateway(pushgateway_url, job="gru4rec_finetune", grouping_key={"group": "train"}, registry=registry)
         log.info(f"[prometheus] Safeguard metrics pushed to {pushgateway_url}")
     except Exception as e:
         log.warning(f"[prometheus] Push gateway failed — {e}")
