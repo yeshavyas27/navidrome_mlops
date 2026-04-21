@@ -62,6 +62,6 @@ echo "[finetune] pulling latest code..."
 #   train:latest \
 #   python3 finetune_gru4rec.py
 
-docker exec -it train python3 train/finetune_gru4rec.py
+docker exec -i train python3 train/finetune_gru4rec.py
 
 echo "[finetune] done."
