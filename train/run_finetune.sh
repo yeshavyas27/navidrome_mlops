@@ -39,27 +39,29 @@ MLFLOW_URI="${MLFLOW_URI:-http://129.114.27.204:8000}"
 : "${MINIO_PASSWORD:?MINIO_PASSWORD must be set}"
 
 echo "[finetune] pulling latest code..."
-git -C "$REPO_DIR" pull origin navidrome-custom
+# git -C "$REPO_DIR" pull origin navidrome-custom
 
-echo "[finetune] building train image (cache will make this fast)..."
-docker build \
-  -t train:latest \
-  -f "$REPO_DIR/train/docker_amd/Dockerfile" \
-  "$REPO_DIR/train"
+# echo "[finetune] building train image (cache will make this fast)..."
+# docker build \
+#   -t train:latest \
+#   -f "$REPO_DIR/train/docker_amd/Dockerfile" \
+#   "$REPO_DIR/train"
 
-echo "[finetune] starting finetune run..."
-docker run --rm \
-  --device=/dev/kfd \
-  --device=/dev/dri \
-  --group-add "$(stat -c "%g" /dev/kfd)" \
-  --group-add "$(stat -c "%g" /dev/dri/card0)" \
-  --shm-size=12g \
-  -e MINIO_URL="$MINIO_URL" \
-  -e MINIO_BUCKET="$MINIO_BUCKET" \
-  -e MINIO_USER="$MINIO_USER" \
-  -e MINIO_PASSWORD="$MINIO_PASSWORD" \
-  -e MLFLOW_TRACKING_URI="$MLFLOW_URI" \
-  train:latest \
-  python3 finetune_gru4rec.py
+# echo "[finetune] starting finetune run..."
+# docker run --rm \
+#   --device=/dev/kfd \
+#   --device=/dev/dri \
+#   --group-add "$(stat -c "%g" /dev/kfd)" \
+#   --group-add "$(stat -c "%g" /dev/dri/card0)" \
+#   --shm-size=12g \
+#   -e MINIO_URL="$MINIO_URL" \
+#   -e MINIO_BUCKET="$MINIO_BUCKET" \
+#   -e MINIO_USER="$MINIO_USER" \
+#   -e MINIO_PASSWORD="$MINIO_PASSWORD" \
+#   -e MLFLOW_TRACKING_URI="$MLFLOW_URI" \
+#   train:latest \
+#   python3 finetune_gru4rec.py
+
+docker exec -it train python3 train/finetune_gru4rec.py
 
 echo "[finetune] done."
