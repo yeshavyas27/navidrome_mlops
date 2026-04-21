@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react'
 import { useTranslate, useDataProvider, Title } from 'react-admin'
+import { useDispatch } from 'react-redux'
 import {
   Card,
   CardContent,
@@ -12,9 +13,12 @@ import {
   CircularProgress,
   Box,
   Chip,
+  IconButton,
 } from '@material-ui/core'
 import { makeStyles } from '@material-ui/core/styles'
 import MusicNoteIcon from '@material-ui/icons/MusicNote'
+import PlayArrowIcon from '@material-ui/icons/PlayArrow'
+import { playTracks } from '../actions'
 
 const useStyles = makeStyles((theme) => ({
   root: {
@@ -52,6 +56,7 @@ const useStyles = makeStyles((theme) => ({
 const RecommendationList = () => {
   const classes = useStyles()
   const translate = useTranslate()
+  const dispatch = useDispatch()
   const [recommendations, setRecommendations] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
@@ -145,7 +150,23 @@ const RecommendationList = () => {
                         className={classes.score}
                       />
                     )}
-
+                    <IconButton
+                      aria-label="play"
+                      onClick={() => {
+                        const songData = {
+                          [rec.id]: {
+                            id: rec.id,
+                            title: rec.title,
+                            artist: rec.artist,
+                            album: rec.album || '',
+                            duration: 30,
+                          },
+                        }
+                        dispatch(playTracks(songData, [rec.id], rec.id))
+                      }}
+                    >
+                      <PlayArrowIcon />
+                    </IconButton>
                   </ListItem>
                 ))}
               </List>
