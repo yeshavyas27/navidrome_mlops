@@ -10,3 +10,4 @@ gdown
 boto3
 redis
 requests
+prometheus_client
