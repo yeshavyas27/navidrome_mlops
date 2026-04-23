@@ -62,6 +62,10 @@ echo "[finetune] pulling latest code..."
 #   train:latest \
 #   python3 finetune_gru4rec.py
 
+# source /home/cc/train.env && docker run -d -p 8000:8000 -v /home/cc/navidrome_mlops:/home/appuser/work --device=/dev/kfd --device=/dev/dri --group-add $(stat -c "%g" /dev/kfd) --group-add $(stat -c "%g" /dev/dri/card0) --shm-size=12g -e MINIO_USER="$MINIO_USER" -e MINIO_PASSWORD="$MINIO_PASSWORD" -e MLFLOW_TRACKING_URI="http://129.114.27.204:8000" -e MINIO_URL="http://129.114.27.204:9000" -e MINIO_BUCKET="artifacts" -e PROMETHEUS_PUSHGATEWAY_URL="http://129.114.27.204:9090" --name train train:latest sleep infinity
+
+docker exec -i train pip install prometheus_client
+
 docker exec -i train python3 train/finetune_gru4rec.py
 
 echo "[finetune] done."
