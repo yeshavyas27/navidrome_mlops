@@ -31,6 +31,16 @@ import platform
 import subprocess
 from collections import defaultdict
 
+# Load credentials from /home/cc/train.env if present and vars not already set
+_env_file = "/home/cc/train.env"
+if os.path.isfile(_env_file):
+    with open(_env_file) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _, _v = _line.partition("=")
+                os.environ.setdefault(_k.strip(), _v.strip())
+
 import numpy as np
 import pandas as pd
 import torch
