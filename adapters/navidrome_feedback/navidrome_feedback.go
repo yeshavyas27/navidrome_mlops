@@ -52,7 +52,8 @@ type feedbackScrobbler struct {
 	feedbackURL string
 	httpClient  *http.Client
 	posMu       sync.Mutex
-	lastPos     map[string]int 
+	lastPos     map[string]int
+}
 
 func newFeedbackScrobbler(ds model.DataStore) scrobbler.Scrobbler {
 	url := os.Getenv("FEEDBACK_API_URL")
