@@ -461,7 +461,13 @@ def prepare_finetune_data(cfg: dict) -> dict:
     log.info("Loading user2idx.json ...")
     with open(user2idx_path) as fh:
         user2idx_raw = json.load(fh)
-    user2idx = {int(k): int(v) for k, v in user2idx_raw.items()}
+    try:
+        user2idx = {int(k): int(v) for k, v in user2idx_raw.items()}
+    except ValueError:
+        # User IDs are strings (e.g. Navidrome UUIDs) — remap to sequential ints
+        unique_users = sorted(set(user2idx_raw.keys()))
+        user2idx = {u: i for i, u in enumerate(unique_users)}
+        log.info(f"String user IDs detected — remapped {len(user2idx):,} users to sequential ints")
 
     log.info(
         f"Fine-tune dataset {version} loaded: "
