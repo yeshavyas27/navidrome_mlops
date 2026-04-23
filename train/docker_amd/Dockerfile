@@ -60,6 +60,6 @@ USER appuser
 ENV MLFLOW_TRACKING_URI="http://129.114.27.204:8000"
 ENV MINIO_URL="http://129.114.27.204:9000"
 ENV MINIO_BUCKET="artifacts"
-ENV PROMETHEUS_PUSHGATEWAY_URL="http://129.114.27.204:9090"
+ENV PROMETHEUS_PUSHGATEWAY_URL="http://129.114.27.204:9091"
 # MINIO_USER and MINIO_PASSWORD are passed at runtime — never baked into the image:
 # docker run --env-file .env ...  OR  docker run -e MINIO_USER=... -e MINIO_PASSWORD=... ...
