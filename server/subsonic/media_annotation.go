@@ -112,6 +112,7 @@ func (api *Router) setStar(ctx context.Context, star bool, ids ...string) error 
 		return nil
 	}
 	event := &events.RefreshResource{}
+	var likedSongIDs []string
 	err := api.ds.WithTxImmediate(func(tx model.DataStore) error {
 		for _, id := range ids {
 			exist, err := tx.Album(ctx).Exists(id)
@@ -143,6 +144,9 @@ func (api *Router) setStar(ctx context.Context, star bool, ids ...string) error 
 				return err
 			}
 			event = event.With("song", id)
+			if star {
+				likedSongIDs = append(likedSongIDs, id)
+			}
 		}
 		api.broker.SendMessage(ctx, event)
 		return nil
@@ -150,6 +154,15 @@ func (api *Router) setStar(ctx context.Context, star bool, ids ...string) error 
 	if err != nil {
 		log.Error(ctx, err)
 		return err
+	}
+	// Treat a like as a full listen (play_count += 1, playratio = 1.0) so the
+	// song enters the user's play history for recommendations. The scrobbler
+	// has no NowPlaying position for likes, so feedbackScrobbler defaults to
+	// ratio = 1.0. This also dispatches to the ML feedback API.
+	if len(likedSongIDs) > 0 {
+		if err := api.scrobblerSubmit(ctx, likedSongIDs, nil); err != nil {
+			log.Warn(ctx, "Failed to scrobble liked songs", "ids", likedSongIDs, err)
+		}
 	}
 	return nil
 }

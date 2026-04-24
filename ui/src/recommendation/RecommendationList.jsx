@@ -14,7 +14,9 @@ import {
   Box,
   Chip,
   IconButton,
+  Snackbar,
 } from '@material-ui/core'
+import MuiAlert from '@material-ui/lab/Alert'
 import { makeStyles } from '@material-ui/core/styles'
 import MusicNoteIcon from '@material-ui/icons/MusicNote'
 import PlayArrowIcon from '@material-ui/icons/PlayArrow'
@@ -63,6 +65,7 @@ const RecommendationList = () => {
   const [error, setError] = useState(null)
   const [modelVersion, setModelVersion] = useState('')
   const [generatedAt, setGeneratedAt] = useState('')
+  const [unavailableTrack, setUnavailableTrack] = useState(null)
 
   useEffect(() => {
     const fetchRecommendations = async () => {
@@ -101,8 +104,11 @@ const RecommendationList = () => {
       dispatch(playTracks(songData, [data.id], data.id))
     } catch (e) {
       console.error('Failed to play track:', e)
+      setUnavailableTrack(rec.title || rec.track_id || 'this track')
     }
   }
+
+  const handleCloseUnavailable = () => setUnavailableTrack(null)
 
   if (loading) {
     return (
@@ -184,6 +190,17 @@ const RecommendationList = () => {
           )}
         </CardContent>
       </Card>
+
+      <Snackbar
+        open={unavailableTrack !== null}
+        autoHideDuration={5000}
+        onClose={handleCloseUnavailable}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+      >
+        <MuiAlert onClose={handleCloseUnavailable} severity="warning" elevation={6} variant="filled">
+          Audio file not available for &quot;{unavailableTrack}&quot;
+        </MuiAlert>
+      </Snackbar>
     </>
   )
 }

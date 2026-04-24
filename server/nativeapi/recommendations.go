@@ -84,12 +84,17 @@ func (api *Router) getRecommendations() http.HandlerFunc {
 			return
 		}
 
-		// Get some tracks from the library to use as seed for recommendations.
-		// Uses random tracks — in production this would use the user's play history.
-		// At 30Music ingest, the 30Music track_id is stored in MbzRecordingID,
-		// which is what the model's vocab is keyed on.
+		// Fetch the user's play history from Postgres (via the annotation table).
+		// The annotation table is joined per-user inside selectMediaFile/withAnnotation,
+		// so filtering by annotation.play_count scopes results to the current user only.
+		// Sort by play_date DESC so the most recently played tracks seed the session.
 		mfRepo := api.ds.MediaFile(ctx)
-		songs, err := mfRepo.GetAll(model.QueryOptions{Max: 10, Sort: "random"})
+		songs, err := mfRepo.GetAll(model.QueryOptions{
+			Max:     50,
+			Sort:    "play_date",
+			Order:   "desc",
+			Filters: squirrel.Expr("COALESCE(annotation.play_count, 0) > 0"),
+		})
 
 		// Extract 30Music track IDs from the filename path.
 		// Files are named like "audio_complete/3012335.mp3" where 3012335 is the
@@ -113,15 +118,12 @@ func (api *Router) getRecommendations() http.HandlerFunc {
 			trackIDs = []string{}
 		}
 
-		// Ask for many recommendations so we can filter to tracks in our library.
-		// The model knows 745k tracks but we only have ~2k. Request top 200
-		// then filter to tracks that exist locally.
 		reqBody := serveRecommendRequest{
 			SessionID:       "navidrome-ui-" + user.UserName,
 			UserID:          user.UserName,
 			TrackIDs:        trackIDs,
 			ExcludeTrackIDs: []string{},
-			TopN:            100,
+			TopN:            10,
 		}
 		jsonBody, _ := json.Marshal(reqBody)
 
@@ -154,37 +156,35 @@ func (api *Router) getRecommendations() http.HandlerFunc {
 			return
 		}
 
-		// Filter recommendations to only tracks that exist in our library.
-		// Look up metadata (title, artist) from Navidrome's database by matching
-		// the recommended track ID to the filename in the media_file path.
+		// Build recommendation items from the serving response.
+		// For each track, try to enrich with local library metadata (Navidrome ID,
+		// album). If the track isn't in our library we still include it — the
+		// frontend's "audio not available" popup handles that case gracefully.
 		var recs []RecommendationItem
-		rank := 0
-		for _, rec := range serveResp.Recommendations {
-			if rank >= 10 {
-				break
-			}
-
-			// Search for this track in Navidrome's library by filename pattern
-			pathPattern := "%" + rec.TrackID + ".mp3"
-			matches, err := mfRepo.GetAll(model.QueryOptions{
-				Max:    1,
-				Filters: squirrel.Like{"media_file.path": pathPattern},
-			})
-			if err != nil || len(matches) == 0 {
-				continue // Skip tracks not in our library
-			}
-
-			mf := matches[0]
-			rank++
-			recs = append(recs, RecommendationItem{
-				ID:      mf.ID,
+		for i, rec := range serveResp.Recommendations {
+			item := RecommendationItem{
 				TrackID: rec.TrackID,
 				Score:   rec.Score,
-				Rank:    rank,
-				Title:   mf.Title,
-				Artist:  mf.Artist,
-				Album:   mf.Album,
+				Rank:    i + 1,
+				Title:   rec.Title,
+				Artist:  rec.Artist,
+			}
+
+			// Try to enrich from Navidrome's library by matching filename.
+			pathPattern := "%" + rec.TrackID + ".mp3"
+			matches, err := mfRepo.GetAll(model.QueryOptions{
+				Max:     1,
+				Filters: squirrel.Like{"media_file.path": pathPattern},
 			})
+			if err == nil && len(matches) > 0 {
+				mf := matches[0]
+				item.ID = mf.ID
+				item.Title = mf.Title
+				item.Artist = mf.Artist
+				item.Album = mf.Album
+			}
+
+			recs = append(recs, item)
 		}
 
 		uiResp := RecommendationResponse{
