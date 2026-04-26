@@ -97,11 +97,37 @@ const RecommendationList = () => {
 
   const handlePlay = async (rec) => {
     try {
-      // Fetch the full song record from Navidrome's API
-      const { data } = await dataProvider.getOne('song', { id: rec.id })
-      // Build the data object that playTracks expects
-      const songData = { [data.id]: data }
-      dispatch(playTracks(songData, [data.id], data.id))
+      if (rec.id) {
+        // Track is also in Navidrome's local library — play via the standard
+        // Subsonic path so scrobbles + library state stay coherent.
+        const { data } = await dataProvider.getOne('song', { id: rec.id })
+        const songData = { [data.id]: data }
+        dispatch(playTracks(songData, [data.id], data.id))
+        return
+      }
+
+      // Track isn't in the local library (the common case — recs are 30Music
+      // track IDs that we stream from Chameleon Swift). Play via the public
+      // /play/<track_id> proxy in nativeapi/recommendations.go, which 302s to
+      // a presigned RGW URL. Setting isRadio:true makes the player use the
+      // streamUrl verbatim instead of building a Subsonic /stream URL.
+      if (!rec.track_id) {
+        setUnavailableTrack(rec.title || 'this track')
+        return
+      }
+      const tid = rec.track_id
+      const synthetic = {
+        id: tid,
+        mediaFileId: tid,
+        title: rec.title || `Track ${tid}`,
+        artist: rec.artist || 'Unknown Artist',
+        name: rec.title || `Track ${tid}`,
+        album: rec.album || '',
+        isRadio: true,
+        streamUrl: `/play/${tid}`,
+        cover: '',
+      }
+      dispatch(playTracks({ [tid]: synthetic }, [tid], tid))
     } catch (e) {
       console.error('Failed to play track:', e)
       setUnavailableTrack(rec.title || rec.track_id || 'this track')
