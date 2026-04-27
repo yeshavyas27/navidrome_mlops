@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -19,16 +18,31 @@ import (
 	"github.com/navidrome/navidrome/model"
 )
 
-const scraperName = "navidrome_feedback"
+const (
+	scraperName       = "navidrome_feedback"
+	flushTrackCount   = 1
+	scrobbleThreshold = 0.5
+)
 
 var sessionTimeout = 30 * time.Minute
 
+type playbackState struct {
+	NavidromeID string
+	TrackID     string
+	Duration    float64
+	MaxPosition float64
+	Scrobbled   bool
+}
+
 type sessionEntry struct {
-	UserID     string
-	TrackIDs   []string
-	PlayRatios []float64
-	StartTime  time.Time
-	LastPlay   time.Time
+	UserID         string
+	TrackIDs       []string
+	PlayRatios     []float64
+	PlayTimestamps []time.Time
+	StartTime      time.Time
+	LastPlay       time.Time
+	InFlight       *playbackState
+	LastFinalized  string
 }
 
 type sessionBuffer struct {
@@ -36,13 +50,16 @@ type sessionBuffer struct {
 	sessions map[string]*sessionEntry
 }
 
-type feedbackPayload struct {
-	SessionID      string    `json:"session_id"`
-	UserID         string    `json:"user_id"`
-	PrefixTrackIDs []string  `json:"prefix_track_ids"`
-	PlayRatios     []float64 `json:"playratios"`
-	Timestamp      string    `json:"timestamp"`
-	Source         string    `json:"source"`
+type activityItem struct {
+	TrackID   string  `json:"track_id"`
+	PlayRatio float64 `json:"play_ratio"`
+	Timestamp string  `json:"timestamp"`
+}
+
+type activityPayload struct {
+	UserID     string         `json:"user_id"`
+	Activities []activityItem `json:"activities"`
+	Source     string         `json:"source"`
 }
 
 var buf = &sessionBuffer{sessions: make(map[string]*sessionEntry)}
@@ -51,8 +68,6 @@ type feedbackScrobbler struct {
 	ds          model.DataStore
 	feedbackURL string
 	httpClient  *http.Client
-	posMu       sync.Mutex
-	lastPos     map[string]int
 }
 
 func newFeedbackScrobbler(ds model.DataStore) scrobbler.Scrobbler {
@@ -65,18 +80,54 @@ func newFeedbackScrobbler(ds model.DataStore) scrobbler.Scrobbler {
 		ds:          ds,
 		feedbackURL: url,
 		httpClient:  &http.Client{Timeout: 5 * time.Second},
-		lastPos:     make(map[string]int),
 	}
+}
+
+// resolveTrackID extracts the 30Music integer ID from the filename
+// (audio_complete/3012335.mp3 -> "3012335"), falling back to MbzRecordingID,
+// then Navidrome's UUID.
+func resolveTrackID(m *model.MediaFile) string {
+	if m.MbzRecordingID != "" {
+		return m.MbzRecordingID
+	}
+	base := filepath.Base(m.Path)
+	ext := filepath.Ext(base)
+	if id := strings.TrimSuffix(base, ext); id != "" {
+		return id
+	}
+	return m.ID
 }
 
 func (f *feedbackScrobbler) IsAuthorized(_ context.Context, _ string) bool {
 	return true
 }
 
-func (f *feedbackScrobbler) NowPlaying(_ context.Context, userID string, t *model.MediaFile, position int) error {
-	f.posMu.Lock()
-	f.lastPos[userID+"_"+t.ID] = position
-	f.posMu.Unlock()
+func (f *feedbackScrobbler) NowPlaying(ctx context.Context, userID string, track *model.MediaFile, position int) error {
+	if track == nil {
+		return nil
+	}
+	buf.mu.Lock()
+	defer buf.mu.Unlock()
+
+	entry := getOrStartSession(ctx, userID)
+	pos := float64(position)
+
+	if entry.InFlight == nil || entry.InFlight.NavidromeID != track.ID {
+		if entry.InFlight != nil {
+			finalizeInFlight(entry)
+		}
+		entry.InFlight = &playbackState{
+			NavidromeID: track.ID,
+			TrackID:     resolveTrackID(track),
+			Duration:    float64(track.Duration),
+			MaxPosition: pos,
+		}
+	} else if pos > entry.InFlight.MaxPosition {
+		entry.InFlight.MaxPosition = pos
+	}
+	entry.LastPlay = time.Now()
+
+	f.maybeFlush(ctx, userID, entry)
 	return nil
 }
 
@@ -84,9 +135,33 @@ func (f *feedbackScrobbler) Scrobble(ctx context.Context, userID string, s scrob
 	buf.mu.Lock()
 	defer buf.mu.Unlock()
 
-	entry, exists := buf.sessions[userID]
-	now := time.Now()
+	entry := getOrStartSession(ctx, userID)
+	navidromeID := s.MediaFile.ID
 
+	switch {
+	case entry.InFlight != nil && entry.InFlight.NavidromeID == navidromeID:
+		entry.InFlight.Scrobbled = true
+	case entry.LastFinalized == navidromeID:
+		// Already counted via track-change finalize; Scrobble is a duplicate signal.
+	default:
+		if entry.InFlight != nil {
+			finalizeInFlight(entry)
+		}
+		entry.TrackIDs = append(entry.TrackIDs, resolveTrackID(&s.MediaFile))
+		entry.PlayRatios = append(entry.PlayRatios, 1.0)
+		entry.PlayTimestamps = append(entry.PlayTimestamps, time.Now())
+		entry.LastFinalized = navidromeID
+	}
+	entry.LastPlay = time.Now()
+
+	f.maybeFlush(ctx, userID, entry)
+	return nil
+}
+
+// must hold buf.mu
+func getOrStartSession(ctx context.Context, userID string) *sessionEntry {
+	now := time.Now()
+	entry, exists := buf.sessions[userID]
 	if !exists || now.Sub(entry.LastPlay) > sessionTimeout {
 		entry = &sessionEntry{
 			UserID:    userID,
@@ -96,86 +171,110 @@ func (f *feedbackScrobbler) Scrobble(ctx context.Context, userID string, s scrob
 		buf.sessions[userID] = entry
 		log.Debug(ctx, "New ML session started", "user", userID)
 	}
+	return entry
+}
 
-	// ID mapping: extract the 30Music integer track_id from the filename.
-	// Files are named like "audio_complete/3012335.mp3" where 3012335 is the
-	// 30Music track ID. Fall back to MbzRecordingID, then Navidrome UUID.
-	trackID := s.MediaFile.MbzRecordingID
-	if trackID == "" {
-		base := filepath.Base(s.MediaFile.Path)
-		ext := filepath.Ext(base)
-		trackID = strings.TrimSuffix(base, ext)
+// must hold buf.mu
+func finalizeInFlight(entry *sessionEntry) {
+	p := entry.InFlight
+	if p == nil {
+		return
 	}
-	if trackID == "" {
-		trackID = s.MediaFile.ID
-	}
-
-	// Compute playratio from the last NowPlaying position; fall back to 1.0
-	// when we have no position (e.g. scrobbler fires on a track we never saw
-	// NowPlaying for, or duration is missing).
-	posKey := userID + "_" + s.MediaFile.ID
-	f.posMu.Lock()
-	pos := f.lastPos[posKey]
-	delete(f.lastPos, posKey)
-	f.posMu.Unlock()
-
-	ratio := 1.0
-	if s.MediaFile.Duration > 0 && pos > 0 {
-		ratio = float64(pos) / float64(s.MediaFile.Duration)
-		if ratio > 1.0 {
-			ratio = 1.0
-		}
-	}
-
-	entry.TrackIDs   = append(entry.TrackIDs, trackID)
+	ratio := computeRatio(p)
+	entry.TrackIDs = append(entry.TrackIDs, p.TrackID)
 	entry.PlayRatios = append(entry.PlayRatios, ratio)
-	entry.LastPlay   = now
+	entry.PlayTimestamps = append(entry.PlayTimestamps, time.Now())
+	entry.LastFinalized = p.NavidromeID
+	entry.InFlight = nil
+}
 
-	// Flush after every scrobble so single-track plays still produce a
-	// session row. Original >= 3 mirrored training-data session lengths,
-	// but inference doesn't need that — GRU4Rec scores "what comes next"
-	// given any prefix length, including 1. Lowering this also makes
-	// testing/demos far less brittle (no 90+ second listen requirement).
-	if len(entry.TrackIDs) >= 1 {
-		entryCopy := *entry
-		go f.sendSession(ctx, userID, &entryCopy)
-		delete(buf.sessions, userID)
+func computeRatio(p *playbackState) float64 {
+	if p.Duration <= 0 {
+		if p.Scrobbled {
+			return 1.0
+		}
+		return 0.0
 	}
+	r := p.MaxPosition / p.Duration
+	// Scrobble fired but NowPlaying may have missed late position updates;
+	// trust the scrobble threshold as a floor.
+	if p.Scrobbled && r < scrobbleThreshold {
+		r = scrobbleThreshold
+	}
+	if r > 1.0 {
+		r = 1.0
+	}
+	if r < 0.0 {
+		r = 0.0
+	}
+	return r
+}
 
-	return nil
+// must hold buf.mu
+func (f *feedbackScrobbler) maybeFlush(ctx context.Context, userID string, entry *sessionEntry) {
+	if len(entry.TrackIDs) < flushTrackCount {
+		return
+	}
+	flushed := &sessionEntry{
+		UserID:         entry.UserID,
+		TrackIDs:       append([]string(nil), entry.TrackIDs...),
+		PlayRatios:     append([]float64(nil), entry.PlayRatios...),
+		PlayTimestamps: append([]time.Time(nil), entry.PlayTimestamps...),
+		StartTime:      entry.StartTime,
+	}
+	go f.sendSession(ctx, userID, flushed)
+
+	// Preserve in-flight track and dedupe state across the flush so the
+	// currently-playing track keeps accumulating position data.
+	now := time.Now()
+	buf.sessions[userID] = &sessionEntry{
+		UserID:        userID,
+		StartTime:     now,
+		LastPlay:      entry.LastPlay,
+		InFlight:      entry.InFlight,
+		LastFinalized: entry.LastFinalized,
+	}
 }
 
 func (f *feedbackScrobbler) sendSession(ctx context.Context, userID string, entry *sessionEntry) {
-	sessionID := fmt.Sprintf("%s_%d", userID, entry.StartTime.Unix())
-	payload := feedbackPayload{
-		SessionID:      sessionID,
-		UserID:         userID,
-		PrefixTrackIDs: entry.TrackIDs,
-		PlayRatios:     entry.PlayRatios,
-		Timestamp:      entry.StartTime.UTC().Format(time.RFC3339),
-		Source:         "navidrome_live",
+	activities := make([]activityItem, len(entry.TrackIDs))
+	for i := range entry.TrackIDs {
+		ts := entry.PlayTimestamps[i]
+		if ts.IsZero() {
+			ts = time.Now()
+		}
+		activities[i] = activityItem{
+			TrackID:   entry.TrackIDs[i],
+			PlayRatio: entry.PlayRatios[i],
+			Timestamp: ts.UTC().Format(time.RFC3339),
+		}
+	}
+	payload := activityPayload{
+		UserID:     userID,
+		Activities: activities,
+		Source:     "navidrome_live",
 	}
 
 	body, err := json.Marshal(payload)
 	if err != nil {
-		log.Error(ctx, "Failed to marshal ML session", "user", userID, err)
+		log.Error(ctx, "Failed to marshal activity batch", "user", userID, err)
 		return
 	}
 
 	resp, err := f.httpClient.Post(
-		f.feedbackURL+"/api/feedback",
+		f.feedbackURL+"/api/activity",
 		"application/json",
 		bytes.NewReader(body),
 	)
 	if err != nil {
-		log.Error(ctx, "Failed to send ML session", "user", userID, err)
+		log.Error(ctx, "Failed to send activity batch", "user", userID, err)
 		return
 	}
 	defer resp.Body.Close()
 
-	log.Info(ctx, "ML session sent",
+	log.Info(ctx, "Activity batch sent",
 		"user", userID,
-		"tracks", len(entry.TrackIDs),
+		"activities", len(activities),
 		"status", resp.StatusCode,
 	)
 }

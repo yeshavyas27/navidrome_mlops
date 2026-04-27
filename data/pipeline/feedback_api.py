@@ -22,6 +22,8 @@ import pandas as pd
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 
+from rollup import ensure_schema, rollup_user, SESSION_ROLLUP_SIZE
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger(__name__)
 
@@ -116,29 +118,9 @@ async def startup():
 async def setup_postgres():
     try:
         conn = get_pg()
-        cur  = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS sessions (
-                id                SERIAL PRIMARY KEY,
-                session_id        TEXT NOT NULL UNIQUE,
-                user_id           TEXT,
-                navidrome_user_id TEXT,
-                track_ids         TEXT[],
-                play_ratios       FLOAT[],
-                play_times        FLOAT[],
-                num_tracks        INT,
-                timestamp         TIMESTAMPTZ DEFAULT NOW(),
-                source            TEXT DEFAULT 'live',
-                ingested_at       TIMESTAMPTZ DEFAULT NOW()
-            );
-            CREATE INDEX IF NOT EXISTS idx_sessions_user_id   ON sessions(user_id);
-            CREATE INDEX IF NOT EXISTS idx_sessions_timestamp ON sessions(timestamp);
-            CREATE INDEX IF NOT EXISTS idx_sessions_source    ON sessions(source);
-            CREATE INDEX IF NOT EXISTS idx_sessions_ingested  ON sessions(ingested_at);
-        """)
-        conn.commit()
+        ensure_schema(conn)
         release_pg(conn)
-        log.info("PostgreSQL sessions table ready")
+        log.info(f"PostgreSQL schema ready (rollup size={SESSION_ROLLUP_SIZE})")
     except Exception as e:
         log.error(f"PostgreSQL setup failed: {e}")
 
@@ -174,7 +156,18 @@ async def load_vocab_to_redis():
 # ============================================================
 # SCHEMAS
 # ============================================================
+class Activity(BaseModel):
+    track_id:   str
+    play_ratio: float
+    timestamp:  str
+
+class ActivityBatch(BaseModel):
+    user_id:    str
+    activities: List[Activity]
+    source:     Optional[str] = "navidrome_live"
+
 class SessionEvent(BaseModel):
+    """Legacy payload for /api/feedback. Kept for backwards compatibility."""
     session_id:       str
     user_id:          str
     prefix_track_ids: List[str]
@@ -221,30 +214,41 @@ def preprocess_for_inference(session: SessionEvent) -> dict:
 # ============================================================
 # WRITE TO POSTGRESQL
 # ============================================================
-def write_to_postgres(session: SessionEvent):
+def write_activities(batch: ActivityBatch):
+    """Insert activities into user_activity, then roll up if threshold hit."""
     try:
         conn = get_pg()
         cur  = conn.cursor()
-        cur.execute("""
-            INSERT INTO sessions
-                (session_id, user_id, track_ids, play_ratios,
-                 num_tracks, timestamp, source)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (session_id) DO NOTHING
-        """, (
-            session.session_id,
-            session.user_id,
-            session.prefix_track_ids,
-            session.playratios,
-            len(session.prefix_track_ids),
-            session.timestamp or datetime.now(timezone.utc).isoformat(),
-            session.source,
-        ))
+        rows = [
+            (batch.user_id, a.track_id, float(a.play_ratio), a.timestamp)
+            for a in batch.activities
+        ]
+        cur.executemany("""
+            INSERT INTO user_activity (user_id, track_id, play_ratio, timestamp)
+            VALUES (%s, %s, %s, %s)
+        """, rows)
         conn.commit()
+        sessions_created = rollup_user(conn, batch.user_id, source=batch.source)
         release_pg(conn)
-        log.info(f"Written session {session.session_id} to PostgreSQL")
+        log.info(
+            f"Inserted {len(rows)} activities for user={batch.user_id}; "
+            f"rollups created: {sessions_created}"
+        )
     except Exception as e:
-        log.error(f"PostgreSQL write failed: {e}")
+        log.error(f"Activity write failed: {e}")
+
+def session_event_to_batch(session: SessionEvent) -> ActivityBatch:
+    """Compat: explode the legacy session payload into per-track activities."""
+    base = session.timestamp or datetime.now(timezone.utc).isoformat()
+    activities = [
+        Activity(track_id=tid, play_ratio=float(pr), timestamp=base)
+        for tid, pr in zip(session.prefix_track_ids, session.playratios)
+    ]
+    return ActivityBatch(
+        user_id=session.user_id,
+        activities=activities,
+        source=session.source or "navidrome_live",
+    )
 
 # ============================================================
 # FLUSH TO SWIFT
@@ -279,10 +283,17 @@ def flush_to_swift():
 # ============================================================
 # ENDPOINTS
 # ============================================================
+@app.post("/api/activity")
+async def receive_activity(batch: ActivityBatch, background_tasks: BackgroundTasks):
+    background_tasks.add_task(write_activities, batch)
+    return {"status": "accepted", "count": len(batch.activities)}
+
 @app.post("/api/feedback")
 async def receive_feedback(session: SessionEvent, background_tasks: BackgroundTasks):
+    """Legacy session-shaped payload. Routed through the activity pipeline."""
     global event_buffer
-    background_tasks.add_task(write_to_postgres, session)
+    batch = session_event_to_batch(session)
+    background_tasks.add_task(write_activities, batch)
     event_buffer.append(session)
     if len(event_buffer) >= BUFFER_SIZE:
         background_tasks.add_task(flush_to_swift)
@@ -397,14 +408,28 @@ async def stats():
                 COUNT(*) FILTER (WHERE source = 'navidrome_live') as navidrome_sessions
             FROM sessions
         """)
-        row = cur.fetchone()
+        srow = cur.fetchone()
+        cur.execute("""
+            SELECT
+                COUNT(*) as total_activities,
+                COUNT(DISTINCT user_id) as activity_users,
+                COUNT(*) FILTER (WHERE session_id IS NULL) as unassigned,
+                AVG(play_ratio)::float as avg_play_ratio
+            FROM user_activity
+        """)
+        arow = cur.fetchone()
         release_pg(conn)
         return {
-            "total_sessions":     row[0],
-            "unique_users":       row[1],
-            "last_ingested":      str(row[2]),
-            "live_sessions":      row[3],
-            "navidrome_sessions": row[4],
+            "total_sessions":     srow[0],
+            "unique_users":       srow[1],
+            "last_ingested":      str(srow[2]),
+            "live_sessions":      srow[3],
+            "navidrome_sessions": srow[4],
+            "total_activities":   arow[0],
+            "activity_users":     arow[1],
+            "unassigned_activities": arow[2],
+            "avg_play_ratio":     round(arow[3], 3) if arow[3] is not None else None,
+            "rollup_size":        SESSION_ROLLUP_SIZE,
             "buffer_size":        len(event_buffer),
             "dataset_version":    DATASET_VERSION,
             "vocab_version":      get_redis().get("vocab:version"),

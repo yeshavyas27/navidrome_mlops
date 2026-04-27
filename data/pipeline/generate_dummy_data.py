@@ -14,6 +14,8 @@ import json
 import argparse
 from datetime import datetime, timezone, timedelta
 
+from rollup import ensure_schema, rollup_all_users, SESSION_ROLLUP_SIZE
+
 # ============================================================
 # CONFIG
 # ============================================================
@@ -135,49 +137,58 @@ def generate_all_sessions():
     
     return sessions
 
+def explode_to_activities(sessions):
+    """Flatten generated sessions into per-track activity rows.
+
+    Each track inside a session gets a synthetic timestamp spaced ~3 minutes
+    apart from the session's start time, so per-activity timestamps are
+    monotonic and realistic for downstream rollup ordering.
+    """
+    activities = []
+    for s in sessions:
+        base_ts = datetime.fromisoformat(s["timestamp"])
+        for i, (tid, pr) in enumerate(zip(s["track_ids"], s["play_ratios"])):
+            activities.append((
+                s["user_id"],
+                tid,
+                float(pr),
+                (base_ts + timedelta(minutes=i * 3)).isoformat(),
+            ))
+    return activities
+
+
 def insert_to_postgres(sessions, host, port, dbname, user, password):
-    """Insert all sessions into PostgreSQL."""
+    """Insert generated data as user_activity rows, then roll up to sessions."""
     conn = psycopg2.connect(
         host=host, port=port,
         dbname=dbname, user=user, password=password
     )
+    ensure_schema(conn)
     cur = conn.cursor()
-    
-    inserted = 0
-    skipped  = 0
-    batch_size = 500
-    
-    for i in range(0, len(sessions), batch_size):
-        batch = sessions[i:i+batch_size]
-        for s in batch:
-            try:
-                cur.execute("""
-                    INSERT INTO sessions
-                        (session_id, user_id, track_ids, play_ratios,
-                         num_tracks, timestamp, source)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (session_id) DO NOTHING
-                """, (
-                    s["session_id"],
-                    s["user_id"],
-                    s["track_ids"],
-                    s["play_ratios"],
-                    s["num_tracks"],
-                    s["timestamp"],
-                    s["source"],
-                ))
-                inserted += 1
-            except Exception as e:
-                skipped += 1
 
+    activities = explode_to_activities(sessions)
+    inserted = 0
+    batch_size = 1000
+
+    for i in range(0, len(activities), batch_size):
+        batch = activities[i:i + batch_size]
+        cur.executemany("""
+            INSERT INTO user_activity (user_id, track_id, play_ratio, timestamp)
+            VALUES (%s, %s, %s, %s)
+        """, batch)
         conn.commit()
-        print(f"  inserted {min(i+batch_size, len(sessions))}/{len(sessions)} sessions...")
-    
+        inserted += len(batch)
+        print(f"  inserted {inserted}/{len(activities)} activities...")
+
+    print(f"\nRolling up activities into sessions (size={SESSION_ROLLUP_SIZE})...")
+    sessions_created = rollup_all_users(conn)
+    print(f"Created {sessions_created} sessions from rollup.")
+
     conn.close()
-    return inserted, skipped
+    return inserted, sessions_created
 
 def verify(host, port, dbname, user, password):
-    """Verify data was inserted correctly."""
+    """Verify data was inserted correctly across both tables."""
     conn = psycopg2.connect(
         host=host, port=port,
         dbname=dbname, user=user, password=password
@@ -187,21 +198,38 @@ def verify(host, port, dbname, user, password):
         SELECT
             COUNT(*) as total,
             COUNT(DISTINCT user_id) as unique_users,
-            AVG(num_tracks) as avg_tracks,
+            COUNT(*) FILTER (WHERE session_id IS NULL) as unassigned,
+            AVG(play_ratio)::float as avg_ratio,
             MIN(timestamp) as earliest,
-            MAX(timestamp) as latest,
+            MAX(timestamp) as latest
+        FROM user_activity
+    """)
+    a = cur.fetchone()
+    cur.execute("""
+        SELECT
+            COUNT(*) as total,
+            COUNT(DISTINCT user_id) as unique_users,
+            AVG(num_tracks) as avg_tracks,
             COUNT(*) FILTER (WHERE source = 'navidrome_live') as live_sessions
         FROM sessions
     """)
-    row = cur.fetchone()
+    s = cur.fetchone()
     conn.close()
     return {
-        "total_sessions":  row[0],
-        "unique_users":    row[1],
-        "avg_tracks":      round(float(row[2] or 0), 2),
-        "earliest":        str(row[3]),
-        "latest":          str(row[4]),
-        "live_sessions":   row[5],
+        "user_activity": {
+            "total":            a[0],
+            "unique_users":     a[1],
+            "unassigned":       a[2],
+            "avg_play_ratio":   round(float(a[3] or 0), 3),
+            "earliest":         str(a[4]),
+            "latest":           str(a[5]),
+        },
+        "sessions": {
+            "total":          s[0],
+            "unique_users":   s[1],
+            "avg_tracks":     round(float(s[2] or 0), 2),
+            "live_sessions":  s[3],
+        },
     }
 
 if __name__ == "__main__":
@@ -223,11 +251,11 @@ if __name__ == "__main__":
     print(f"Generated {len(sessions):,} sessions")
 
     print(f"\nInserting to PostgreSQL at {args.host}:{args.port}...")
-    inserted, skipped = insert_to_postgres(
+    inserted, sessions_created = insert_to_postgres(
         sessions, args.host, args.port,
         args.dbname, args.user, args.password
     )
-    print(f"Inserted: {inserted:,} | Skipped: {skipped:,}")
+    print(f"Activities inserted: {inserted:,} | Sessions created: {sessions_created:,}")
 
     print("\nVerifying...")
     stats = verify(args.host, args.port, args.dbname, args.user, args.password)
