@@ -153,8 +153,11 @@ func (api *Router) getRecommendations() http.HandlerFunc {
 		//      below threshold) filtered out server-side.
 		//   2. Fall back to Navidrome's annotation table when the user has no
 		//      session yet (404) or the feedback API is unreachable.
+		// We query by user.ID (the internal Navidrome UUID), not user.UserName,
+		// because the scrobbler's Submit hook receives the UUID as its userID
+		// arg and that's what gets persisted to the sessions.user_id column.
 		var trackIDs []string
-		feedbackTrackIDs, feedbackErr := fetchLatestSession(ctx, user.UserName, minPlayratioThreshold)
+		feedbackTrackIDs, feedbackErr := fetchLatestSession(ctx, user.ID, minPlayratioThreshold)
 		if feedbackErr != nil {
 			log.Warn(ctx, "feedback API session fetch failed; falling back to annotation table",
 				"user", user.UserName, "err", feedbackErr)
