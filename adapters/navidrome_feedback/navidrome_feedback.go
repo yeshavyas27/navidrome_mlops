@@ -131,7 +131,12 @@ func (f *feedbackScrobbler) Scrobble(ctx context.Context, userID string, s scrob
 	entry.PlayRatios = append(entry.PlayRatios, ratio)
 	entry.LastPlay   = now
 
-	if len(entry.TrackIDs) >= 3 {
+	// Flush after every scrobble so single-track plays still produce a
+	// session row. Original >= 3 mirrored training-data session lengths,
+	// but inference doesn't need that — GRU4Rec scores "what comes next"
+	// given any prefix length, including 1. Lowering this also makes
+	// testing/demos far less brittle (no 90+ second listen requirement).
+	if len(entry.TrackIDs) >= 1 {
 		entryCopy := *entry
 		go f.sendSession(ctx, userID, &entryCopy)
 		delete(buf.sessions, userID)
