@@ -25,9 +25,13 @@ import (
 // FEEDBACK_API_URL env var on the navidrome deployment.
 const defaultFeedbackAPIURL = "http://feedback-api.navidrome-platform.svc.cluster.local:8080"
 
-// Tracks below this playratio are treated as skips and excluded from the
-// inference input. 0.5 is the standard "actually listened" cutoff.
-const minPlayratioThreshold = 0.5
+// Tracks below this playratio are treated as skips and excluded from
+// the inference input. Set to 0.0 (no filter) while the new activity-
+// based scrobbler's playratio computation stabilises — it currently
+// returns 0 even for tracks that scrobbled because NowPlaying position
+// isn't being updated continuously, just at track start. Bump back
+// toward 0.5 once playratio numbers are accurate.
+const minPlayratioThreshold = 0.0
 
 // latestSessionResponse mirrors feedback_api.py's GET /api/session/latest payload.
 type latestSessionResponse struct {
