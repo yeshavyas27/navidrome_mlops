@@ -13,6 +13,7 @@ import psycopg2
 import requests
 from datetime import datetime, timezone, timedelta
 import mlflow
+from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger(__name__)
@@ -29,6 +30,7 @@ PG_PASS  = os.getenv("PG_PASS",  "navidrome2026")
 MLFLOW_URI      = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow.navidrome-platform.svc.cluster.local:8000")
 DATASET_VERSION = os.getenv("DATASET_VERSION", "v20260419-001")
 SWIFT_BASE      = "https://chi.uc.chameleoncloud.org:7480/swift/v1/AUTH_7c0a7a1952e44c94aa75cae1ff5dc9b4/navidrome-bucket-proj05"
+PUSHGATEWAY_URL = os.getenv("PUSHGATEWAY_URL", "pushgateway.navidrome-monitoring.svc.cluster.local:9091")
 
 # ============================================================
 # STEP 1 — Load training baseline from Swift manifest
@@ -190,6 +192,37 @@ def push_to_mlflow(metrics):
     log.info(f"MLflow logged -> experiment: navidrome-data-drift | run: {run_name}")
 
 # ============================================================
+# STEP 6 — Push to Prometheus Pushgateway
+# ============================================================
+def push_to_prometheus(metrics):
+    """Expose drift metrics as Prometheus gauges via the Pushgateway.
+
+    Each numeric metric becomes navidrome_<key>; the Pushgateway holds
+    them indefinitely, Prometheus scrapes the gateway, and Grafana
+    queries Prometheus for the dashboard.
+    """
+    registry = CollectorRegistry()
+    for k, v in metrics.items():
+        if not isinstance(v, (int, float)) or isinstance(v, bool):
+            continue
+        gauge = Gauge(
+            f"navidrome_{k}",
+            f"{k} from drift monitor",
+            registry=registry,
+        )
+        gauge.set(float(v))
+    try:
+        push_to_gateway(
+            PUSHGATEWAY_URL,
+            job="drift_monitor",
+            registry=registry,
+            grouping_key={"dataset_version": DATASET_VERSION},
+        )
+        log.info(f"Prometheus pushed -> {PUSHGATEWAY_URL} (job=drift_monitor)")
+    except Exception as e:
+        log.error(f"Pushgateway push failed (non-fatal): {e}")
+
+# ============================================================
 # MAIN
 # ============================================================
 if __name__ == "__main__":
@@ -214,6 +247,7 @@ if __name__ == "__main__":
         metrics = compute_drift_metrics(training_stats, prod_df, alltime_stats)
 
     push_to_mlflow(metrics)
+    push_to_prometheus(metrics)
 
     log.info("=== Drift Monitor Complete ===")
     if metrics.get("drift_alert"):

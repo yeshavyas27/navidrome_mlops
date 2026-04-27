@@ -14,13 +14,23 @@ spec:
             image: python:3.10-slim
             command: ["/bin/sh", "-c"]
             args:
-              - "pip install pandas pyarrow mlflow numpy python-swiftclient python-keystoneclient psycopg2-binary requests -q &&
+              - "pip install pandas pyarrow mlflow numpy python-swiftclient python-keystoneclient psycopg2-binary requests prometheus_client -q &&
                  python /app/monitor_drift.py"
             env:
             - name: MLFLOW_TRACKING_URI
               value: "http://mlflow.navidrome-platform.svc.cluster.local:8000"
+            - name: PUSHGATEWAY_URL
+              value: "pushgateway.navidrome-monitoring.svc.cluster.local:9091"
             - name: DATASET_VERSION
               value: "v20260418-001"
+            - name: PG_HOST
+              value: "postgres.navidrome-platform.svc.cluster.local"
+            - name: PG_DB
+              value: "navidrome"
+            - name: PG_USER
+              value: "postgres"
+            - name: PG_PASS
+              value: "MyPassword123"
             - name: OS_AUTH_URL
               value: "https://chi.uc.chameleoncloud.org:5000/v3"
             - name: OS_APPLICATION_CREDENTIAL_ID

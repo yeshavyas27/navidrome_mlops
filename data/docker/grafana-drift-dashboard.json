@@ -1,0 +1,207 @@
+{
+  "title": "Navidrome — Data Drift Monitor",
+  "uid": "navidrome-drift",
+  "tags": ["navidrome", "drift", "ml"],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "1m",
+  "time": { "from": "now-24h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "dataset_version",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(navidrome_prod_sessions_24h, dataset_version)",
+        "refresh": 1,
+        "includeAll": true,
+        "multi": false
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Drift Alert",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "navidrome_drift_alert{job=\"drift_monitor\", dataset_version=~\"$dataset_version\"}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red",   "value": 1 }
+            ]
+          },
+          "mappings": [
+            { "options": { "0": { "text": "OK" } },     "type": "value" },
+            { "options": { "1": { "text": "DRIFT" } },  "type": "value" }
+          ],
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value_and_name"
+      }
+    },
+    {
+      "id": 2,
+      "title": "Sessions (last 24h)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "targets": [{
+        "expr": "navidrome_prod_sessions_24h{job=\"drift_monitor\", dataset_version=~\"$dataset_version\"}",
+        "refId": "A"
+      }],
+      "options": { "colorMode": "value", "graphMode": "area" }
+    },
+    {
+      "id": 3,
+      "title": "Unique Users (24h)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "targets": [{
+        "expr": "navidrome_prod_unique_users_24h{job=\"drift_monitor\", dataset_version=~\"$dataset_version\"}",
+        "refId": "A"
+      }],
+      "options": { "colorMode": "value", "graphMode": "area" }
+    },
+    {
+      "id": 4,
+      "title": "Vocab Coverage",
+      "type": "gauge",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "targets": [{
+        "expr": "navidrome_vocab_coverage{job=\"drift_monitor\", dataset_version=~\"$dataset_version\"}",
+        "refId": "A"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0, "max": 1,
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red",    "value": null },
+              { "color": "yellow", "value": 0.3 },
+              { "color": "green",  "value": 0.6 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 5,
+      "title": "Average Play Ratio",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [{
+        "expr": "navidrome_prod_avg_playratio{job=\"drift_monitor\", dataset_version=~\"$dataset_version\"}",
+        "refId": "A",
+        "legendFormat": "avg play ratio"
+      }],
+      "fieldConfig": {
+        "defaults": { "min": 0, "max": 1, "unit": "percentunit" }
+      }
+    },
+    {
+      "id": 6,
+      "title": "Skip vs Full-Play Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [
+        {
+          "expr": "navidrome_prod_skip_rate{job=\"drift_monitor\", dataset_version=~\"$dataset_version\"}",
+          "refId": "A",
+          "legendFormat": "skip rate (ratio <= 0.25)"
+        },
+        {
+          "expr": "navidrome_prod_full_play_rate{job=\"drift_monitor\", dataset_version=~\"$dataset_version\"}",
+          "refId": "B",
+          "legendFormat": "full-play rate (ratio >= 0.75)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "min": 0, "max": 1, "unit": "percentunit" }
+      }
+    },
+    {
+      "id": 7,
+      "title": "Session Length Drift",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [{
+        "expr": "navidrome_session_length_drift{job=\"drift_monitor\", dataset_version=~\"$dataset_version\"}",
+        "refId": "A",
+        "legendFormat": "|prod_avg_len - train_avg_len| / train_avg_len"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green",  "value": null },
+              { "color": "yellow", "value": 0.15 },
+              { "color": "red",    "value": 0.3 }
+            ]
+          },
+          "custom": { "thresholdsStyle": { "mode": "line" } }
+        }
+      }
+    },
+    {
+      "id": 8,
+      "title": "New User Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [{
+        "expr": "navidrome_new_user_rate{job=\"drift_monitor\", dataset_version=~\"$dataset_version\"}",
+        "refId": "A",
+        "legendFormat": "(prod_users_24h - train_users) / train_users"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green",  "value": null },
+              { "color": "yellow", "value": 0.25 },
+              { "color": "red",    "value": 0.5 }
+            ]
+          },
+          "custom": { "thresholdsStyle": { "mode": "line" } }
+        }
+      }
+    },
+    {
+      "id": 9,
+      "title": "Total PG Sessions / Users (cumulative)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
+      "targets": [
+        {
+          "expr": "navidrome_total_pg_sessions{job=\"drift_monitor\", dataset_version=~\"$dataset_version\"}",
+          "refId": "A",
+          "legendFormat": "total sessions"
+        },
+        {
+          "expr": "navidrome_total_pg_users{job=\"drift_monitor\", dataset_version=~\"$dataset_version\"}",
+          "refId": "B",
+          "legendFormat": "total users"
+        }
+      ]
+    }
+  ]
+}
