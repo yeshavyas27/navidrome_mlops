@@ -108,9 +108,11 @@ const RecommendationList = () => {
 
       // Track isn't in the local library (the common case — recs are 30Music
       // track IDs that we stream from Chameleon Swift). Play via the public
-      // /play/<track_id> proxy in nativeapi/recommendations.go, which 302s to
-      // a presigned RGW URL. Setting isRadio:true makes the player use the
-      // streamUrl verbatim instead of building a Subsonic /stream URL.
+      // /api/recommendation/play/<track_id> proxy in nativeapi (registered as
+      // a public route in native_api.go because the HTML5 audio tag can't
+      // send auth headers), which 302s to a presigned RGW URL. Setting
+      // isRadio:true makes the player use streamUrl verbatim instead of
+      // building a Subsonic /stream URL.
       if (!rec.track_id) {
         setUnavailableTrack(rec.title || 'this track')
         return
@@ -124,7 +126,7 @@ const RecommendationList = () => {
         name: rec.title || `Track ${tid}`,
         album: rec.album || '',
         isRadio: true,
-        streamUrl: `/play/${tid}`,
+        streamUrl: `/api/recommendation/play/${tid}`,
         cover: '',
       }
       dispatch(playTracks({ [tid]: synthetic }, [tid], tid))
