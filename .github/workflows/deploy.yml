@@ -105,10 +105,6 @@ jobs:
                     - dockerfile=/mnt/workspace
                     - --output
                     - type=image,name=registry.kube-system.svc.cluster.local:5000/navidrome-custom:latest,push=true,registry.insecure=true
-                    - --export-cache
-                    - type=registry,ref=registry.kube-system.svc.cluster.local:5000/navidrome-custom:buildcache,mode=max,registry.insecure=true
-                    - --import-cache
-                    - type=registry,ref=registry.kube-system.svc.cluster.local:5000/navidrome-custom:buildcache,registry.insecure=true
                   securityContext:
                     runAsUser: 1000
                     runAsGroup: 1000
