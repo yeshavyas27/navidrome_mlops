@@ -200,7 +200,8 @@ def post_activities(user_id: str, track_ids: List[str], base_ts: datetime) -> No
         })
     r = requests.post(
         f"{FEEDBACK_URL}/api/activity",
-        json={"user_id": user_id, "activities": activities, "source": "simulation"},
+        json={"user_id": user_id, "activities": activities,
+              "source": os.getenv("SIM_SOURCE", "navidrome_live")},
         timeout=15,
     )
     r.raise_for_status()
