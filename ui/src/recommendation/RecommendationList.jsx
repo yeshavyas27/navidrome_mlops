@@ -138,6 +138,20 @@ const RecommendationList = () => {
 
   const handleCloseUnavailable = () => setUnavailableTrack(null)
 
+  // Normalize raw GRU4Rec logits (e.g. -9.2 ... -10.5) to a user-readable
+  // 0-100 "Match" percentage. We min/max scale within the displayed top-10
+  // rather than across the full 745k vocab — the user only sees these 10,
+  // so what matters is *relative* quality among them. The top rec always
+  // shows 100, the bottom rec always shows 0; tightly-bunched scores still
+  // produce a meaningful spread across 0-100.
+  const topRecs    = recommendations.slice(0, 10)
+  const validScores = topRecs.map((r) => r.score).filter((s) => s != null && !Number.isNaN(s))
+  const minScore = validScores.length > 0 ? Math.min(...validScores) : 0
+  const maxScore = validScores.length > 0 ? Math.max(...validScores) : 1
+  const scoreSpan = maxScore - minScore || 1
+  const matchPct = (score) =>
+    Math.max(0, Math.min(100, Math.round(((score - minScore) / scoreSpan) * 100)))
+
   if (loading) {
     return (
       <Box display="flex" justifyContent="center" alignItems="center" minHeight="200px">
@@ -189,9 +203,9 @@ const RecommendationList = () => {
                       primary={rec.title || `Track ${rec.track_id || rec.id}`}
                       secondary={rec.artist || 'Unknown Artist'}
                     />
-                    {rec.score != null && (
+                    {rec.score != null && !Number.isNaN(rec.score) && (
                       <Chip
-                        label={`Score: ${rec.score.toFixed(1)}`}
+                        label={`Match: ${matchPct(rec.score)}%`}
                         size="small"
                         color="primary"
                         variant="outlined"
