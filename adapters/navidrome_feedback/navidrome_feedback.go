@@ -32,6 +32,7 @@ type playbackState struct {
 	Duration    float64
 	MaxPosition float64
 	Scrobbled   bool
+	StartedAt   time.Time
 }
 
 type sessionEntry struct {
@@ -121,6 +122,7 @@ func (f *feedbackScrobbler) NowPlaying(ctx context.Context, userID string, track
 			TrackID:     resolveTrackID(track),
 			Duration:    float64(track.Duration),
 			MaxPosition: pos,
+			StartedAt:   time.Now(),
 		}
 	} else if pos > entry.InFlight.MaxPosition {
 		entry.InFlight.MaxPosition = pos
@@ -195,9 +197,18 @@ func computeRatio(p *playbackState) float64 {
 		}
 		return 0.0
 	}
-	r := p.MaxPosition / p.Duration
-	// Scrobble fired but NowPlaying may have missed late position updates;
-	// trust the scrobble threshold as a floor.
+	// Some Navidrome clients call NowPlaying once at pos=0 and never tick
+	// again, so MaxPosition stays at 0 even for tracks the user listened
+	// to. Fall back to wall-clock elapsed since the in-flight was created.
+	// MaxPosition wins when the client does send progressive updates
+	// (more accurate, doesn't count pause time).
+	played := p.MaxPosition
+	if !p.StartedAt.IsZero() {
+		if elapsed := time.Since(p.StartedAt).Seconds(); elapsed > played {
+			played = elapsed
+		}
+	}
+	r := played / p.Duration
 	if p.Scrobbled && r < scrobbleThreshold {
 		r = scrobbleThreshold
 	}
