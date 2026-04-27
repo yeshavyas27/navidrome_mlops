@@ -2,9 +2,13 @@ package nativeapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -16,6 +20,61 @@ import (
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/model/request"
 )
+
+// Default cluster-internal DNS for the feedback API. Overridable via
+// FEEDBACK_API_URL env var on the navidrome deployment.
+const defaultFeedbackAPIURL = "http://feedback-api.navidrome-platform.svc.cluster.local:8080"
+
+// Tracks below this playratio are treated as skips and excluded from the
+// inference input. 0.5 is the standard "actually listened" cutoff.
+const minPlayratioThreshold = 0.5
+
+// latestSessionResponse mirrors feedback_api.py's GET /api/session/latest payload.
+type latestSessionResponse struct {
+	SessionID  string    `json:"session_id"`
+	UserID     string    `json:"user_id"`
+	TrackIDs   []string  `json:"track_ids"`
+	PlayRatios []float64 `json:"play_ratios"`
+	Timestamp  string    `json:"timestamp"`
+	NumTracks  int       `json:"num_tracks"`
+}
+
+// fetchLatestSession returns the most recent session's track IDs for the
+// given user from the feedback API, with playratio-based filtering applied
+// server-side. Returns (nil, nil) when the user has no session yet (404)
+// — caller should fall back to a different signal in that case.
+func fetchLatestSession(ctx context.Context, userID string, minPR float64) ([]string, error) {
+	base := os.Getenv("FEEDBACK_API_URL")
+	if base == "" {
+		base = defaultFeedbackAPIURL
+	}
+	u := fmt.Sprintf("%s/api/session/latest?user_id=%s&min_playratio=%.2f",
+		base, url.QueryEscape(userID), minPR)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil // user has no sessions yet → caller falls back
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("feedback API status %d: %s", resp.StatusCode, string(body))
+	}
+	var sess latestSessionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&sess); err != nil {
+		return nil, err
+	}
+	return sess.TrackIDs, nil
+}
 
 // RecommendationItem represents a single recommendation returned to the UI
 type RecommendationItem struct {
@@ -84,43 +143,52 @@ func (api *Router) getRecommendations() http.HandlerFunc {
 			return
 		}
 
-		// Fetch the user's play history from Postgres (via the annotation table).
-		// The annotation table is joined per-user inside selectMediaFile/withAnnotation,
-		// so filtering by annotation.play_count scopes results to the current user only.
-		// We pull the 50 most recent plays (DESC), then reverse to chronological
-		// order before sending to GRU4Rec — the model is a session RNN whose
-		// prediction is "what comes after the LAST item in the input sequence,"
-		// so the sequence must run oldest → newest.
+		// mfRepo is used both for the annotation-table fallback below AND for
+		// per-recommendation library enrichment further down, so we hoist it.
 		mfRepo := api.ds.MediaFile(ctx)
-		songs, err := mfRepo.GetAll(model.QueryOptions{
-			Max:     50,
-			Sort:    "play_date",
-			Order:   "desc",
-			Filters: squirrel.Expr("COALESCE(annotation.play_count, 0) > 0"),
-		})
 
-		// Reverse so the slice runs oldest → newest (chronological order for the model).
-		if err == nil {
-			for i, j := 0, len(songs)-1; i < j; i, j = i+1, j-1 {
-				songs[i], songs[j] = songs[j], songs[i]
-			}
-		}
-
-		// Extract 30Music track IDs from the filename path.
-		// Files are named like "audio_complete/3012335.mp3" where 3012335 is the
-		// 30Music track ID that matches the model vocabulary.
-		// Falls back to MbzRecordingID if available.
+		// Source priority for the GRU4Rec input prefix:
+		//   1. Feedback API's latest session for this user — already chronological,
+		//      already grouped into a real session, with skipped tracks (playratio
+		//      below threshold) filtered out server-side.
+		//   2. Fall back to Navidrome's annotation table when the user has no
+		//      session yet (404) or the feedback API is unreachable.
 		var trackIDs []string
-		if err == nil {
-			for _, mf := range songs {
-				// Try to extract integer ID from filename (e.g. "3012335" from "audio_complete/3012335.mp3")
-				base := filepath.Base(mf.Path)
-				ext := filepath.Ext(base)
-				nameWithoutExt := strings.TrimSuffix(base, ext)
-				if nameWithoutExt != "" && nameWithoutExt != base {
-					trackIDs = append(trackIDs, nameWithoutExt)
-				} else if mf.MbzRecordingID != "" {
-					trackIDs = append(trackIDs, mf.MbzRecordingID)
+		feedbackTrackIDs, feedbackErr := fetchLatestSession(ctx, user.UserName, minPlayratioThreshold)
+		if feedbackErr != nil {
+			log.Warn(ctx, "feedback API session fetch failed; falling back to annotation table",
+				"user", user.UserName, "err", feedbackErr)
+		}
+		if len(feedbackTrackIDs) > 0 {
+			trackIDs = feedbackTrackIDs
+		} else {
+			// Fallback: annotation table — last 50 plays, sorted DESC by play_date.
+			// We reverse the slice so the sequence runs oldest → newest, matching
+			// what GRU4Rec expects (its prediction is "what comes after the LAST
+			// item in the input").
+			songs, err := mfRepo.GetAll(model.QueryOptions{
+				Max:     50,
+				Sort:    "play_date",
+				Order:   "desc",
+				Filters: squirrel.Expr("COALESCE(annotation.play_count, 0) > 0"),
+			})
+
+			if err == nil {
+				for i, j := 0, len(songs)-1; i < j; i, j = i+1, j-1 {
+					songs[i], songs[j] = songs[j], songs[i]
+				}
+				// Extract 30Music track IDs from the filename path.
+				// Files are named like "audio_complete/3012335.mp3" where 3012335
+				// is the 30Music track ID. Falls back to MbzRecordingID.
+				for _, mf := range songs {
+					base := filepath.Base(mf.Path)
+					ext := filepath.Ext(base)
+					nameWithoutExt := strings.TrimSuffix(base, ext)
+					if nameWithoutExt != "" && nameWithoutExt != base {
+						trackIDs = append(trackIDs, nameWithoutExt)
+					} else if mf.MbzRecordingID != "" {
+						trackIDs = append(trackIDs, mf.MbzRecordingID)
+					}
 				}
 			}
 		}
