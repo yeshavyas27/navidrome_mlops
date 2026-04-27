@@ -239,8 +239,14 @@ const Player = () => {
         document.title = 'Navidrome'
       }
 
+      // Threshold lowered from the original Last.fm 50%/240s. Our recommendation
+      // pipeline already filters by playratio >= 0.5 at inference time
+      // (recommendations.go → /api/session/latest?min_playratio=0.5), so the
+      // scrobble-time gate was redundant AND was dropping useful partial-listen
+      // signal. 25%/30s here captures any track that got real engagement;
+      // playratio is still attached so inference can do the final quality call.
       const progress = (info.currentTime / info.duration) * 100
-      if (isNaN(info.duration) || (progress < 50 && info.currentTime < 240)) {
+      if (isNaN(info.duration) || (progress < 25 && info.currentTime < 30)) {
         return
       }
 
