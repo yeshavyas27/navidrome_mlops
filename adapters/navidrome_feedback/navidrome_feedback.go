@@ -22,17 +22,24 @@ const (
 	scraperName       = "navidrome_feedback"
 	flushTrackCount   = 1
 	scrobbleThreshold = 0.5
+	// maxActiveGap is the longest gap between two NowPlaying ticks (or
+	// between the last tick and a track-change/scrobble) that we still
+	// treat as "actively listening." Anything longer is assumed to be a
+	// pause and excluded from ActivePlayTime.
+	maxActiveGap = 60 * time.Second
 )
 
 var sessionTimeout = 30 * time.Minute
 
 type playbackState struct {
-	NavidromeID string
-	TrackID     string
-	Duration    float64
-	MaxPosition float64
-	Scrobbled   bool
-	StartedAt   time.Time
+	NavidromeID    string
+	TrackID        string
+	Duration       float64
+	MaxPosition    float64
+	Scrobbled      bool
+	StartedAt      time.Time
+	LastTickAt     time.Time
+	ActivePlayTime float64
 }
 
 type sessionEntry struct {
@@ -113,6 +120,7 @@ func (f *feedbackScrobbler) NowPlaying(ctx context.Context, userID string, track
 	entry := getOrStartSession(ctx, userID)
 	pos := float64(position)
 
+	now := time.Now()
 	if entry.InFlight == nil || entry.InFlight.NavidromeID != track.ID {
 		if entry.InFlight != nil {
 			finalizeInFlight(entry)
@@ -122,12 +130,22 @@ func (f *feedbackScrobbler) NowPlaying(ctx context.Context, userID string, track
 			TrackID:     resolveTrackID(track),
 			Duration:    float64(track.Duration),
 			MaxPosition: pos,
-			StartedAt:   time.Now(),
+			StartedAt:   now,
+			LastTickAt:  now,
 		}
-	} else if pos > entry.InFlight.MaxPosition {
-		entry.InFlight.MaxPosition = pos
+	} else {
+		// Same track — accumulate the gap since the last tick if it looks
+		// like uninterrupted play (gap <= maxActiveGap). Larger gaps are
+		// treated as a pause and excluded.
+		if gap := now.Sub(entry.InFlight.LastTickAt); gap > 0 && gap <= maxActiveGap {
+			entry.InFlight.ActivePlayTime += gap.Seconds()
+		}
+		entry.InFlight.LastTickAt = now
+		if pos > entry.InFlight.MaxPosition {
+			entry.InFlight.MaxPosition = pos
+		}
 	}
-	entry.LastPlay = time.Now()
+	entry.LastPlay = now
 
 	f.maybeFlush(ctx, userID, entry)
 	return nil
@@ -197,16 +215,26 @@ func computeRatio(p *playbackState) float64 {
 		}
 		return 0.0
 	}
-	// Some Navidrome clients call NowPlaying once at pos=0 and never tick
-	// again, so MaxPosition stays at 0 even for tracks the user listened
-	// to. Fall back to wall-clock elapsed since the in-flight was created.
-	// MaxPosition wins when the client does send progressive updates
-	// (more accurate, doesn't count pause time).
-	played := p.MaxPosition
-	if !p.StartedAt.IsZero() {
-		if elapsed := time.Since(p.StartedAt).Seconds(); elapsed > played {
-			played = elapsed
+	// Prefer ActivePlayTime — sum of NowPlaying-tick gaps that look like
+	// real listening (each gap <= maxActiveGap; longer gaps treated as
+	// pauses and skipped). Add the trailing gap from the last tick to
+	// finalize if also within threshold.
+	played := p.ActivePlayTime
+	if !p.LastTickAt.IsZero() {
+		if trailing := time.Since(p.LastTickAt).Seconds(); trailing >= 0 && trailing <= maxActiveGap.Seconds() {
+			played += trailing
 		}
+	}
+	// If the client never sent a second NowPlaying tick, ActivePlayTime
+	// stays 0 and the trailing gap won't help if it's > maxActiveGap.
+	// Fall back to wall-clock elapsed so we still produce a useful ratio.
+	if played <= 0 && !p.StartedAt.IsZero() {
+		played = time.Since(p.StartedAt).Seconds()
+	}
+	// MaxPosition (when the client sends progressive positions) is the
+	// most authoritative signal — never go below it.
+	if p.MaxPosition > played {
+		played = p.MaxPosition
 	}
 	r := played / p.Duration
 	if p.Scrobbled && r < scrobbleThreshold {

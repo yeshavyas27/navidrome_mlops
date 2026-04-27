@@ -37,13 +37,18 @@ MINIO_BUCKET   = "navidrome-datasets"
 SWIFT_CONTAINER = "navidrome-bucket-proj05"
 MLFLOW_URI      = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow.navidrome-platform.svc.cluster.local:8000")
 
+# Pipeline gates — both are env-configurable so a small cluster can tune
+# them down without a code change.
+MIN_SESSIONS_PER_RUN = int(os.getenv("MIN_SESSIONS_PER_RUN", "5"))
+MIN_SESSIONS_AFTER_FILTER = int(os.getenv("MIN_SESSIONS_AFTER_FILTER", "5"))
+
 # Filtering thresholds
-MIN_SESSION_LENGTH   = 2
+MIN_SESSION_LENGTH   = 2          # need >=1 prefix + 1 target after split
 MAX_SESSION_LENGTH   = 100
 MIN_ITEM_SUPPORT     = 1
 MIN_USER_SESSIONS    = 1
-SKIP_RATIO_THRESHOLD = 0.25
-TEST_FRACTION        = 0.2
+SKIP_RATIO_THRESHOLD = 0.2        # tracks with play_ratio <= 0.2 are dropped
+TEST_FRACTION        = 0.2        # legacy — unused with leave-one-out split
 HOLDOUT_FRAC         = 0.0
 
 # ============================================================
@@ -248,25 +253,44 @@ def build_sequences(interaction_df, item2idx, user2idx):
     return sequences
 
 # ============================================================
-# STEP 6 — Chronological split — Yesha's temporal_split() logic
+# STEP 6 — In-session leave-one-out split
 # ============================================================
-def chronological_split(session_df, sequences):
-    log.info("\n[STEP 6] Chronological split (pure temporal — no user holdout)...")
-    session_df = session_df.sort_values("timestamp").reset_index(drop=True)
+def leave_one_out_split(sequences):
+    """For each session [a, b, c, d, e]:
+        train  -> [a, b, c, d]            (prefix only, model never sees e)
+        test   -> [a, b, c, d, e]         (full sequence + target_idx = e)
 
-    split_idx = int(len(session_df) * (1 - TEST_FRACTION))
-    train_ids = set(session_df.iloc[:split_idx]["session_id"])
-    test_ids  = set(session_df.iloc[split_idx:]["session_id"])
+    The whole sequence is in test so the model can score "given prefix,
+    what comes next?"; target_idx is the held-out ground truth.
 
-    train_seqs = [s for s in sequences if s["session_id"] in train_ids]
-    test_seqs  = [s for s in sequences if s["session_id"] in test_ids]
+    Each session contributes one train sequence and one test sample.
+    Sessions shorter than 2 tracks are skipped (need at least 1 prefix
+    + 1 target).
+    """
+    log.info("\n[STEP 6] In-session leave-one-out split...")
+    train_seqs, test_seqs = [], []
+    for s in sequences:
+        if len(s["item_idxs"]) < 2:
+            continue
+        train_seqs.append({
+            "session_id": s["session_id"],
+            "user_idx":   s["user_idx"],
+            "item_idxs":  s["item_idxs"][:-1],
+            "playratios": s["playratios"][:-1],
+        })
+        test_seqs.append({
+            "session_id": s["session_id"],
+            "user_idx":   s["user_idx"],
+            "item_idxs":  s["item_idxs"],
+            "playratios": s["playratios"],
+            "target_idx": s["item_idxs"][-1],
+        })
 
-    # verify no user overlap issue
     train_users = set(s["user_idx"] for s in train_seqs)
     test_users  = set(s["user_idx"] for s in test_seqs)
     unseen      = test_users - train_users
     log.info(f"  train: {len(train_seqs):,} | test: {len(test_seqs):,}")
-    log.info(f"  unseen users in test: {len(unseen)} (should be 0)")
+    log.info(f"  unseen users in test: {len(unseen)} (expected 0 — same sessions in both)")
     return train_seqs, test_seqs
 
 # ============================================================
@@ -295,12 +319,11 @@ def upload_dataset(train_seqs, test_seqs, item2idx, user2idx, session_df, intera
         "run_id":       RUN_ID,
         "created_at":   datetime.now(timezone.utc).isoformat(),
         "data_source":  "postgresql_live_24h",
+        "split_strategy": "in_session_leave_one_out",
         "filter_params": {
             "min_session_length":   MIN_SESSION_LENGTH,
             "min_item_support":     MIN_ITEM_SUPPORT,
             "skip_ratio_threshold": SKIP_RATIO_THRESHOLD,
-            "test_fraction":        TEST_FRACTION,
-            "holdout_fraction":     HOLDOUT_FRAC,
         },
         "stats": {
             "pg_sessions_loaded": pg_count,
@@ -356,20 +379,20 @@ if __name__ == "__main__":
 
     pg_df = load_postgres_sessions()
 
-    if len(pg_df) < 50:
-        log.warning(f"Only {len(pg_df)} sessions in last 24h — skipping")
+    if len(pg_df) < MIN_SESSIONS_PER_RUN:
+        log.warning(f"Only {len(pg_df)} sessions in last 24h (need >= {MIN_SESSIONS_PER_RUN}) — skipping")
         exit(0)
 
     session_df, interaction_df = to_interaction_df(pg_df)
     session_df, interaction_df = filter_data(session_df, interaction_df)
 
-    if len(session_df) < 10:
-        log.warning("Not enough sessions after filtering — skipping")
+    if len(session_df) < MIN_SESSIONS_AFTER_FILTER:
+        log.warning(f"Only {len(session_df)} sessions after filtering (need >= {MIN_SESSIONS_AFTER_FILTER}) — skipping")
         exit(0)
 
     item2idx, user2idx = build_vocabs(interaction_df)
     sequences          = build_sequences(interaction_df, item2idx, user2idx)
-    train_seqs, test_seqs = chronological_split(session_df, sequences)
+    train_seqs, test_seqs = leave_one_out_split(sequences)
     manifest           = upload_dataset(train_seqs, test_seqs, item2idx, user2idx,
                                         session_df, interaction_df, len(pg_df))
     log_to_mlflow(manifest)
