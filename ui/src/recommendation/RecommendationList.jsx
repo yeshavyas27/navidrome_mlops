@@ -12,7 +12,6 @@ import {
   Typography,
   CircularProgress,
   Box,
-  Chip,
   IconButton,
   Snackbar,
 } from '@material-ui/core'
@@ -65,6 +64,7 @@ const RecommendationList = () => {
   const [error, setError] = useState(null)
   const [modelVersion, setModelVersion] = useState('')
   const [generatedAt, setGeneratedAt] = useState('')
+  const [coldStartAlpha, setColdStartAlpha] = useState(0)
   const [unavailableTrack, setUnavailableTrack] = useState(null)
 
   useEffect(() => {
@@ -83,6 +83,7 @@ const RecommendationList = () => {
         setRecommendations(data.recommendations || [])
         setModelVersion(data.modelVersion || '')
         setGeneratedAt(data.generatedAt || '')
+        setColdStartAlpha(typeof data.coldStartAlpha === 'number' ? data.coldStartAlpha : 0)
       } catch (err) {
         console.error('Failed to fetch recommendations:', err)
         setError(err.message)
@@ -138,19 +139,19 @@ const RecommendationList = () => {
 
   const handleCloseUnavailable = () => setUnavailableTrack(null)
 
-  // Normalize raw GRU4Rec logits (e.g. -9.2 ... -10.5) to a user-readable
-  // 0-100 "Match" percentage. We min/max scale within the displayed top-10
-  // rather than across the full 745k vocab — the user only sees these 10,
-  // so what matters is *relative* quality among them. The top rec always
-  // shows 100, the bottom rec always shows 0; tightly-bunched scores still
-  // produce a meaningful spread across 0-100.
-  const topRecs    = recommendations.slice(0, 10)
-  const validScores = topRecs.map((r) => r.score).filter((s) => s != null && !Number.isNaN(s))
-  const minScore = validScores.length > 0 ? Math.min(...validScores) : 0
-  const maxScore = validScores.length > 0 ? Math.max(...validScores) : 1
-  const scoreSpan = maxScore - minScore || 1
-  const matchPct = (score) =>
-    Math.max(0, Math.min(100, Math.round(((score - minScore) / scoreSpan) * 100)))
+  // Subtitle + helper text are driven by cold_start_alpha from serving:
+  //   alpha == 0   → no plays at all → pure popularity
+  //   alpha < 0.5  → some plays, popularity still dominates the blend
+  //   alpha >= 0.5 → model dominates, treat as personalized
+  // The hint tells users WHY refreshing without new behavior shows the
+  // same recs — recs only update when input changes (new play / like).
+  const isColdStart = coldStartAlpha < 0.5
+  const subtitle = isColdStart
+    ? 'Top 10 recommendations based on popularity'
+    : 'Top 10 recommendations based on your listening history'
+  const hint = isColdStart
+    ? 'Like (♥) or play 3+ songs for 30+ seconds each to get personalized picks.'
+    : 'Recommendations refresh when you like or play (30s+) more songs.'
 
   if (loading) {
     return (
@@ -188,8 +189,16 @@ const RecommendationList = () => {
 
           {recommendations.length > 0 && (
             <>
-              <Typography variant="body2" color="textSecondary" gutterBottom>
-                Top {Math.min(recommendations.length, 10)} recommendations based on your listening history
+              <Typography variant="body2" color="textSecondary">
+                {subtitle}
+              </Typography>
+              <Typography
+                variant="caption"
+                color="textSecondary"
+                style={{ display: 'block', marginBottom: 12, fontStyle: 'italic' }}
+                gutterBottom
+              >
+                {hint}
               </Typography>
               <List>
                 {recommendations.slice(0, 10).map((rec, index) => (
@@ -203,15 +212,6 @@ const RecommendationList = () => {
                       primary={rec.title || `Track ${rec.track_id || rec.id}`}
                       secondary={rec.artist || 'Unknown Artist'}
                     />
-                    {rec.score != null && !Number.isNaN(rec.score) && (
-                      <Chip
-                        label={`Match: ${matchPct(rec.score)}%`}
-                        size="small"
-                        color="primary"
-                        variant="outlined"
-                        className={classes.score}
-                      />
-                    )}
                     <IconButton
                       aria-label="play"
                       onClick={() => handlePlay(rec)}

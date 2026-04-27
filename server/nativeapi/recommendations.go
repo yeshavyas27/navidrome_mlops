@@ -93,6 +93,10 @@ type RecommendationResponse struct {
 	Recommendations []RecommendationItem `json:"recommendations"`
 	ModelVersion    string               `json:"modelVersion,omitempty"`
 	GeneratedAt     string               `json:"generatedAt,omitempty"`
+	// 0.0 = pure popularity (cold start), 1.0 = pure GRU4Rec.
+	// UI uses this to switch the subtitle between "based on popularity"
+	// and "based on your listening history".
+	ColdStartAlpha float64 `json:"coldStartAlpha"`
 }
 
 // serveRecommendRequest matches the serving container's /recommend-by-tracks schema
@@ -117,6 +121,7 @@ type serveRecommendResponse struct {
 	ModelVersion       string  `json:"model_version"`
 	GeneratedAt        string  `json:"generated_at"`
 	InferenceLatencyMs float64 `json:"inference_latency_ms"`
+	ColdStartAlpha     float64 `json:"cold_start_alpha"`
 }
 
 func (api *Router) addRecommendationRoute(r chi.Router) {
@@ -273,6 +278,7 @@ func (api *Router) getRecommendations() http.HandlerFunc {
 			Recommendations: recs,
 			ModelVersion:    serveResp.ModelVersion,
 			GeneratedAt:     serveResp.GeneratedAt,
+			ColdStartAlpha:  serveResp.ColdStartAlpha,
 		}
 
 		w.Header().Set("Content-Type", "application/json")
