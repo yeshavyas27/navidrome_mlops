@@ -87,7 +87,10 @@ func (api *Router) getRecommendations() http.HandlerFunc {
 		// Fetch the user's play history from Postgres (via the annotation table).
 		// The annotation table is joined per-user inside selectMediaFile/withAnnotation,
 		// so filtering by annotation.play_count scopes results to the current user only.
-		// Sort by play_date DESC so the most recently played tracks seed the session.
+		// We pull the 50 most recent plays (DESC), then reverse to chronological
+		// order before sending to GRU4Rec — the model is a session RNN whose
+		// prediction is "what comes after the LAST item in the input sequence,"
+		// so the sequence must run oldest → newest.
 		mfRepo := api.ds.MediaFile(ctx)
 		songs, err := mfRepo.GetAll(model.QueryOptions{
 			Max:     50,
@@ -95,6 +98,13 @@ func (api *Router) getRecommendations() http.HandlerFunc {
 			Order:   "desc",
 			Filters: squirrel.Expr("COALESCE(annotation.play_count, 0) > 0"),
 		})
+
+		// Reverse so the slice runs oldest → newest (chronological order for the model).
+		if err == nil {
+			for i, j := 0, len(songs)-1; i < j; i, j = i+1, j-1 {
+				songs[i], songs[j] = songs[j], songs[i]
+			}
+		}
 
 		// Extract 30Music track IDs from the filename path.
 		// Files are named like "audio_complete/3012335.mp3" where 3012335 is the
