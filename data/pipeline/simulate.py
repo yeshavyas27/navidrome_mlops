@@ -73,6 +73,16 @@ USERS = [
     {"username": "user3", "email": "user3@gmail.com", "password": "user123", "name": "User Three"},
 ]
 
+# Cold-start seeds — predefined genre clusters per user so each simulated
+# user has a recognisable taste profile. The recommender adapts from there.
+COLD_START_SEEDS = {
+    "user1": ["1542241", "2019543", "886294", "97143", "2288509"],                            # 90s rock
+    "user2": ["10008", "153052", "3542207", "3542211", "22341",
+              "529621", "1216639", "1678409"],                                                # indie / alternative
+    "user3": ["376525", "375370", "88996", "59999", "329288",
+              "548294", "490015", "3666651", "7806"],                                         # pop / dance / r&b
+}
+
 
 # ============================================================
 # DB WIPE
@@ -210,29 +220,33 @@ def post_activities(user_id: str, track_ids: List[str], base_ts: datetime) -> No
 # ============================================================
 # SIMULATION LOOP
 # ============================================================
-def simulate_user(user_id: str, target_plays: int, start_ts: datetime):
-    log.info(f"=== Simulating user {user_id} (target: {target_plays:,} plays) ===")
+def simulate_user(username: str, user_id: str, target_plays: int, start_ts: datetime):
+    log.info(f"=== Simulating {username} ({user_id}) (target: {target_plays:,} plays) ===")
 
-    # 1. Cold start
-    log.info(f"  cold-starting with {COLD_START_SEED} seed tracks...")
-    seeds: List[str] = []
-    for attempt in range(3):
-        try:
-            seeds = get_recommendations(user_id, [], top_n=COLD_START_SEED)
-            break
-        except Exception as e:
-            log.warning(f"  cold-start attempt {attempt + 1} failed: {e}")
-            time.sleep(2 ** attempt)
-    if not seeds:
-        log.error(f"  cold-start failed for {user_id}; skipping")
-        return
+    # 1. Cold start — use predefined genre seeds when available, otherwise
+    # fall back to the recommender's cold-start path.
+    seeds: List[str] = COLD_START_SEEDS.get(username, [])
+    if seeds:
+        log.info(f"  seeding from predefined cluster ({len(seeds)} tracks)")
+    else:
+        log.info(f"  no predefined seeds for {username}; asking recommender...")
+        for attempt in range(3):
+            try:
+                seeds = get_recommendations(user_id, [], top_n=COLD_START_SEED)
+                break
+            except Exception as e:
+                log.warning(f"  cold-start attempt {attempt + 1} failed: {e}")
+                time.sleep(2 ** attempt)
+        if not seeds:
+            log.error(f"  cold-start failed for {user_id}; skipping")
+            return
 
     post_activities(user_id, seeds, start_ts)
     history = list(seeds)
     log.info(f"  seeded {len(history)} plays")
 
     # 2. Recommendation loop
-    iter_ts = start_ts + timedelta(seconds=COLD_START_SEED * 180)
+    iter_ts = start_ts + timedelta(seconds=len(history) * 180)
     last_log = time.time()
     while len(history) < target_plays:
         try:
@@ -296,7 +310,7 @@ def main():
 
     start = datetime.now(timezone.utc) - timedelta(hours=2)
     for username, user_id in user_ids.items():
-        simulate_user(user_id, args.target, start)
+        simulate_user(username, user_id, args.target, start)
 
     log.info("=== Simulation complete ===")
     log.info(f"Per-user totals: target={args.target:,} plays each")
