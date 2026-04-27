@@ -311,54 +311,66 @@ async def preprocess(session_id: str, user_id: str, track_ids: str, playratios: 
 
 
 @app.get("/api/session/latest")
-async def get_latest_session(user_id: str, min_playratio: float = 0.0):
-    """Return the most recent session for a user, optionally filtering tracks
-    by playratio. Used by recommendations.go (Navidrome Go backend) to seed
-    the GRU4Rec input with real session data — chronological order, only
-    tracks the user actually listened to (playratio >= threshold).
+async def get_latest_session(user_id: str, min_playratio: float = 0.0, max_tracks: int = 50):
+    """Build a 'session' for inference from the user's most recent
+    user_activity rows. Reads the raw log directly so inference sees
+    behaviour the moment it's recorded — no waiting for the
+    SESSION_ROLLUP_SIZE rollup boundary (which is 50 by default and
+    primarily exists for training data semantics, not real-time recs).
 
-    Returns 404 if the user has no sessions yet (caller should fall back to
-    cold-start or annotation-table-derived input).
+    track_ids are returned in chronological order (oldest -> newest)
+    matching what GRU4Rec expects: 'predict next given this prefix'.
+    Filters out plays below min_playratio (skips / abandons) so the
+    prefix only contains tracks the user actually listened to.
+
+    Returns 404 if the user has no activity yet (caller should fall
+    back to cold-start / annotation-table input).
     """
     try:
         conn = get_pg()
         cur  = conn.cursor()
+        # ORDER BY timestamp DESC + LIMIT to pull the most recent N,
+        # then we reverse client-side to get chronological order.
         cur.execute(
             """
-            SELECT session_id, user_id, track_ids, play_ratios, timestamp
-              FROM sessions
+            SELECT track_id, play_ratio, timestamp
+              FROM user_activity
              WHERE user_id = %s
-             ORDER BY timestamp DESC
-             LIMIT 1
+             ORDER BY timestamp DESC, id DESC
+             LIMIT %s
             """,
-            (user_id,),
+            (user_id, max_tracks),
         )
-        row = cur.fetchone()
+        rows = cur.fetchall()
         release_pg(conn)
     except Exception as e:
-        log.error(f"sessions query failed for user_id={user_id}: {e}")
+        log.error(f"user_activity query failed for user_id={user_id}: {e}")
         raise HTTPException(status_code=500, detail=f"db error: {e}")
 
-    if row is None:
-        raise HTTPException(status_code=404, detail="no session for user")
+    if not rows:
+        raise HTTPException(status_code=404, detail="no activity for user")
 
-    sid, uid, track_ids, play_ratios, ts = row
-    track_ids   = list(track_ids   or [])
-    play_ratios = list(play_ratios or [])
+    # Reverse to chronological (oldest first) for GRU4Rec.
+    rows = list(reversed(rows))
 
-    # Filter tracks the user skipped / barely played. Keep arrays aligned by
-    # zipping then unzipping so play_ratios[i] always corresponds to track_ids[i].
-    if min_playratio > 0.0 and play_ratios:
+    track_ids   = [r[0] for r in rows]
+    play_ratios = [float(r[1]) for r in rows]
+    last_ts     = rows[-1][2]
+
+    # Filter low-playratio plays (skips). Keep arrays aligned via zip/unzip.
+    if min_playratio > 0.0:
         kept = [(t, p) for t, p in zip(track_ids, play_ratios) if p >= min_playratio]
         track_ids   = [t for t, _ in kept]
         play_ratios = [p for _, p in kept]
 
     return {
-        "session_id":  sid,
-        "user_id":     uid,
+        # No real session_id from user_activity — synthesise one from user+ts
+        # so logs/traces stay correlatable.
+        "session_id":  f"{user_id}_{last_ts.timestamp():.0f}" if last_ts else user_id,
+        "user_id":     user_id,
         "track_ids":   track_ids,
         "play_ratios": play_ratios,
-        "timestamp":   ts.isoformat() if ts else None,
+        "timestamp":   last_ts.isoformat() if last_ts else None,
         "num_tracks":  len(track_ids),
     }
 
