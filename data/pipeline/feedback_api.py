@@ -19,7 +19,7 @@ import psycopg2.pool
 import redis
 import requests
 import pandas as pd
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
@@ -297,6 +297,59 @@ async def preprocess(session_id: str, user_id: str, track_ids: str, playratios: 
         prefix_track_ids=tids, playratios=prs
     )
     return preprocess_for_inference(session)
+
+
+@app.get("/api/session/latest")
+async def get_latest_session(user_id: str, min_playratio: float = 0.0):
+    """Return the most recent session for a user, optionally filtering tracks
+    by playratio. Used by recommendations.go (Navidrome Go backend) to seed
+    the GRU4Rec input with real session data — chronological order, only
+    tracks the user actually listened to (playratio >= threshold).
+
+    Returns 404 if the user has no sessions yet (caller should fall back to
+    cold-start or annotation-table-derived input).
+    """
+    try:
+        conn = get_pg()
+        cur  = conn.cursor()
+        cur.execute(
+            """
+            SELECT session_id, user_id, track_ids, play_ratios, timestamp
+              FROM sessions
+             WHERE user_id = %s
+             ORDER BY timestamp DESC
+             LIMIT 1
+            """,
+            (user_id,),
+        )
+        row = cur.fetchone()
+        release_pg(conn)
+    except Exception as e:
+        log.error(f"sessions query failed for user_id={user_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"db error: {e}")
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="no session for user")
+
+    sid, uid, track_ids, play_ratios, ts = row
+    track_ids   = list(track_ids   or [])
+    play_ratios = list(play_ratios or [])
+
+    # Filter tracks the user skipped / barely played. Keep arrays aligned by
+    # zipping then unzipping so play_ratios[i] always corresponds to track_ids[i].
+    if min_playratio > 0.0 and play_ratios:
+        kept = [(t, p) for t, p in zip(track_ids, play_ratios) if p >= min_playratio]
+        track_ids   = [t for t, _ in kept]
+        play_ratios = [p for _, p in kept]
+
+    return {
+        "session_id":  sid,
+        "user_id":     uid,
+        "track_ids":   track_ids,
+        "play_ratios": play_ratios,
+        "timestamp":   ts.isoformat() if ts else None,
+        "num_tracks":  len(track_ids),
+    }
 
 @app.post("/api/reload-vocab")
 async def reload_vocab():
