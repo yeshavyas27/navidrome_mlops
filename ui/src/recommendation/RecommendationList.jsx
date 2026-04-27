@@ -139,19 +139,23 @@ const RecommendationList = () => {
 
   const handleCloseUnavailable = () => setUnavailableTrack(null)
 
-  // Subtitle + helper text are driven by cold_start_alpha from serving:
-  //   alpha == 0   → no plays at all → pure popularity
-  //   alpha < 0.5  → some plays, popularity still dominates the blend
-  //   alpha >= 0.5 → model dominates, treat as personalized
-  // The hint tells users WHY refreshing without new behavior shows the
-  // same recs — recs only update when input changes (new play / like).
-  const isColdStart = coldStartAlpha < 0.5
+  // Subtitle + helper text driven by cold_start_alpha from serving:
+  //   alpha == 0     → no real plays anywhere, prefix was synthesised from
+  //                    popularity → label honestly as "based on popularity"
+  //   alpha > 0      → at least one real play reached the model, recs reflect
+  //                    user behaviour even if blender weight is still low →
+  //                    label "based on your listening history". Hint nudges
+  //                    them to play more for stronger personalisation.
+  const isColdStart = coldStartAlpha === 0
+  const isPartialPersonalization = coldStartAlpha > 0 && coldStartAlpha < 1
   const subtitle = isColdStart
     ? 'Top 10 recommendations based on popularity'
     : 'Top 10 recommendations based on your listening history'
   const hint = isColdStart
-    ? 'Like (♥) or play 3+ songs for 30+ seconds each to get personalized picks.'
-    : 'Recommendations refresh when you like or play (30s+) more songs.'
+    ? 'Like (♥) or play any song for 30+ seconds to start personalizing your recs.'
+    : isPartialPersonalization
+      ? 'Play or like more songs (3+ plays of 30s+) for fully personalized picks. Recs refresh on each new play/like.'
+      : 'Recommendations refresh when you like or play (30s+) more songs.'
 
   if (loading) {
     return (
