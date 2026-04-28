@@ -311,68 +311,109 @@ async def preprocess(session_id: str, user_id: str, track_ids: str, playratios: 
 
 
 @app.get("/api/session/latest")
-async def get_latest_session(user_id: str, min_playratio: float = 0.0, max_tracks: int = 50):
-    """Build a 'session' for inference from the user's most recent
-    user_activity rows. Reads the raw log directly so inference sees
-    behaviour the moment it's recorded — no waiting for the
-    SESSION_ROLLUP_SIZE rollup boundary (which is 50 by default and
-    primarily exists for training data semantics, not real-time recs).
+async def get_latest_session(
+    user_id: str,
+    min_playratio: float = 0.0,
+    max_tracks: int = 200,
+    within_minutes: int = 30,
+):
+    """Build a recent-activity snapshot for inference AND persist it as a
+    sessions row (source='inference') for audit/replay.
 
-    track_ids are returned in chronological order (oldest -> newest)
-    matching what GRU4Rec expects: 'predict next given this prefix'.
-    Filters out plays below min_playratio (skips / abandons) so the
-    prefix only contains tracks the user actually listened to.
+    Trigger semantics: every call to this endpoint represents the user
+    clicking 'recommend'. We materialise a session so we can later audit
+    which prefix produced which recommendation. The 50-track rollup
+    (run from /api/activity) handles the orthogonal "user accumulated
+    enough plays for training data" trigger and writes
+    source='navidrome_live' rows.
 
-    Returns 404 if the user has no activity yet (caller should fall
-    back to cold-start / annotation-table input).
+    Window:    last `within_minutes` of user_activity (default 30).
+    Safety:    cap at `max_tracks` rows (default 200).
+    Filter:    drop tracks with play_ratio < min_playratio.
+
+    Activities are NOT marked with the snapshot's session_id, so the
+    rollup still consumes them when its 50-track threshold trips.
+    The 'inference' source label keeps these snapshots out of the
+    training pipeline (build_dataset_live filters source='navidrome_live').
+
+    Returns 404 if the user has no qualifying activity in the window.
     """
+    conn = None
     try:
         conn = get_pg()
         cur  = conn.cursor()
-        # ORDER BY timestamp DESC + LIMIT to pull the most recent N,
-        # then we reverse client-side to get chronological order.
         cur.execute(
             """
             SELECT track_id, play_ratio, timestamp
               FROM user_activity
              WHERE user_id = %s
+               AND timestamp >= NOW() - (%s::int || ' minutes')::interval
              ORDER BY timestamp DESC, id DESC
              LIMIT %s
             """,
-            (user_id, max_tracks),
+            (user_id, within_minutes, max_tracks),
         )
         rows = cur.fetchall()
-        release_pg(conn)
+
+        if not rows:
+            raise HTTPException(status_code=404,
+                                detail=f"no activity in last {within_minutes} minutes")
+
+        rows = list(reversed(rows))  # chronological
+        track_ids   = [r[0] for r in rows]
+        play_ratios = [float(r[1]) for r in rows]
+        timestamps  = [r[2] for r in rows]
+
+        if min_playratio > 0.0:
+            kept = [(t, p, ts) for t, p, ts in zip(track_ids, play_ratios, timestamps)
+                    if p >= min_playratio]
+            track_ids   = [t for t, _, _ in kept]
+            play_ratios = [p for _, p, _ in kept]
+            timestamps  = [ts for _, _, ts in kept]
+
+        if not track_ids:
+            raise HTTPException(status_code=404,
+                                detail=f"all activity below min_playratio={min_playratio}")
+
+        first_ts = timestamps[0]
+        last_ts  = timestamps[-1]
+        snap_id  = f"{user_id}_snap_{int(datetime.now(timezone.utc).timestamp())}"
+
+        # Materialise the snapshot. Best-effort — if the insert fails (e.g.,
+        # rare session_id collision when two clicks land in the same second)
+        # we still serve the recs.
+        try:
+            cur.execute(
+                """
+                INSERT INTO sessions
+                    (session_id, user_id, track_ids, play_ratios,
+                     num_tracks, timestamp, end_ts, source)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (session_id) DO NOTHING
+                """,
+                (snap_id, user_id, track_ids, play_ratios,
+                 len(track_ids), first_ts, last_ts, "inference"),
+            )
+            conn.commit()
+        except Exception as e:
+            log.warning(f"snapshot session insert failed (non-fatal): {e}")
+
+        return {
+            "session_id":  snap_id,
+            "user_id":     user_id,
+            "track_ids":   track_ids,
+            "play_ratios": play_ratios,
+            "timestamp":   first_ts.isoformat(),
+            "num_tracks":  len(track_ids),
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         log.error(f"user_activity query failed for user_id={user_id}: {e}")
         raise HTTPException(status_code=500, detail=f"db error: {e}")
-
-    if not rows:
-        raise HTTPException(status_code=404, detail="no activity for user")
-
-    # Reverse to chronological (oldest first) for GRU4Rec.
-    rows = list(reversed(rows))
-
-    track_ids   = [r[0] for r in rows]
-    play_ratios = [float(r[1]) for r in rows]
-    last_ts     = rows[-1][2]
-
-    # Filter low-playratio plays (skips). Keep arrays aligned via zip/unzip.
-    if min_playratio > 0.0:
-        kept = [(t, p) for t, p in zip(track_ids, play_ratios) if p >= min_playratio]
-        track_ids   = [t for t, _ in kept]
-        play_ratios = [p for _, p in kept]
-
-    return {
-        # No real session_id from user_activity — synthesise one from user+ts
-        # so logs/traces stay correlatable.
-        "session_id":  f"{user_id}_{last_ts.timestamp():.0f}" if last_ts else user_id,
-        "user_id":     user_id,
-        "track_ids":   track_ids,
-        "play_ratios": play_ratios,
-        "timestamp":   last_ts.isoformat() if last_ts else None,
-        "num_tracks":  len(track_ids),
-    }
+    finally:
+        if conn is not None:
+            release_pg(conn)
 
 @app.post("/api/reload-vocab")
 async def reload_vocab():
