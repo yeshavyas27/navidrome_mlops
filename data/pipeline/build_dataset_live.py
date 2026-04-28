@@ -14,6 +14,8 @@ import numpy as np
 import psycopg2
 from datetime import datetime, timezone, timedelta
 
+from rollup import rollup_stale_users
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger(__name__)
 
@@ -114,11 +116,24 @@ def load_postgres_sessions():
         host=PG_HOST, port=PG_PORT,
         dbname=PG_DB, user=PG_USER, password=PG_PASS
     )
+    # First flush any sub-threshold users (>24h-old unassigned activity)
+    # so casual listeners aren't invisible to training.
+    stale = rollup_stale_users(conn, max_age_hours=24, min_size=1)
+    if stale:
+        log.info(f"  stale-rollup: created {stale} catch-up session(s)")
+
+    # Both source labels feed training:
+    #   navidrome_live → 50-track rollup (and stale catch-up) — primary
+    #   inference     → 30-min snapshots from recommend clicks — added
+    # The activities behind navidrome_live sessions are stamped (consumed),
+    # while inference snapshots overlay activities that may also live in
+    # a navidrome_live session — that's intentional duplication: more
+    # recent contextual training samples on top of the canonical buckets.
     df = pd.read_sql(f"""
         SELECT session_id, user_id, track_ids, play_ratios,
                num_tracks, timestamp, source
         FROM sessions
-        WHERE source = 'navidrome_live'
+        WHERE source IN ('navidrome_live', 'inference')
           AND timestamp >= '{since.isoformat()}'
         ORDER BY timestamp ASC
     """, conn)

@@ -119,3 +119,64 @@ def rollup_all_users(conn, threshold=None, source="navidrome_live"):
     for u in users:
         total += rollup_user(conn, u, threshold=threshold, source=source)
     return total
+
+
+def rollup_stale_users(conn, max_age_hours=24, min_size=1, source="navidrome_live"):
+    """Catch sub-threshold users so they don't disappear from training data.
+
+    For every user whose oldest unassigned activity is older than
+    max_age_hours, bundle ALL their unassigned activities into a
+    session regardless of count. Activities are stamped, so rollup_user
+    won't double-count them.
+
+    Use case: a casual listener plays 30 tracks/week — they'll never
+    hit SESSION_ROLLUP_SIZE and would otherwise be invisible to the
+    model. Run this nightly so they still appear in training.
+    """
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT user_id, COUNT(*) AS n
+          FROM user_activity
+         WHERE session_id IS NULL
+           AND timestamp <= NOW() - (%s::int || ' hours')::interval
+         GROUP BY user_id
+        HAVING COUNT(*) >= %s
+    """, (max_age_hours, min_size))
+    candidates = [r[0] for r in cur.fetchall()]
+
+    sessions_created = 0
+    for user_id in candidates:
+        cur.execute("""
+            SELECT id, track_id, play_ratio, timestamp
+              FROM user_activity
+             WHERE user_id = %s AND session_id IS NULL
+             ORDER BY timestamp ASC, id ASC
+        """, (user_id,))
+        rows = cur.fetchall()
+        if not rows:
+            continue
+
+        ids         = [r[0] for r in rows]
+        track_ids   = [r[1] for r in rows]
+        play_ratios = [float(r[2]) for r in rows]
+        first_ts    = rows[0][3]
+        last_ts     = rows[-1][3]
+        session_id  = (
+            f"{user_id}_stale_{int(first_ts.timestamp())}"
+            f"_{int(last_ts.timestamp())}_{ids[0]}"
+        )
+
+        cur.execute("""
+            INSERT INTO sessions
+                (session_id, user_id, track_ids, play_ratios,
+                 num_tracks, timestamp, end_ts, source)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (session_id) DO NOTHING
+        """, (session_id, user_id, track_ids, play_ratios,
+              len(rows), first_ts, last_ts, source))
+        cur.execute("""
+            UPDATE user_activity SET session_id = %s WHERE id = ANY(%s)
+        """, (session_id, ids))
+        conn.commit()
+        sessions_created += 1
+    return sessions_created

@@ -377,26 +377,40 @@ async def get_latest_session(
 
         first_ts = timestamps[0]
         last_ts  = timestamps[-1]
-        snap_id  = f"{user_id}_snap_{int(datetime.now(timezone.utc).timestamp())}"
 
-        # Materialise the snapshot. Best-effort — if the insert fails (e.g.,
-        # rare session_id collision when two clicks land in the same second)
-        # we still serve the recs.
-        try:
-            cur.execute(
-                """
-                INSERT INTO sessions
-                    (session_id, user_id, track_ids, play_ratios,
-                     num_tracks, timestamp, end_ts, source)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (session_id) DO NOTHING
-                """,
-                (snap_id, user_id, track_ids, play_ratios,
-                 len(track_ids), first_ts, last_ts, "inference"),
-            )
-            conn.commit()
-        except Exception as e:
-            log.warning(f"snapshot session insert failed (non-fatal): {e}")
+        # Debounce: if we already wrote a snapshot for this user within
+        # the last 60 seconds, return that one instead of writing again.
+        # Catches rapid recommend-clicks / UI refreshes without losing audit.
+        cur.execute(
+            """
+            SELECT session_id, num_tracks
+              FROM sessions
+             WHERE user_id = %s AND source = 'inference'
+               AND ingested_at >= NOW() - INTERVAL '60 seconds'
+             ORDER BY id DESC LIMIT 1
+            """,
+            (user_id,),
+        )
+        recent = cur.fetchone()
+        if recent and recent[1] == len(track_ids):
+            snap_id = recent[0]
+        else:
+            snap_id = f"{user_id}_snap_{int(datetime.now(timezone.utc).timestamp())}"
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO sessions
+                        (session_id, user_id, track_ids, play_ratios,
+                         num_tracks, timestamp, end_ts, source)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (session_id) DO NOTHING
+                    """,
+                    (snap_id, user_id, track_ids, play_ratios,
+                     len(track_ids), first_ts, last_ts, "inference"),
+                )
+                conn.commit()
+            except Exception as e:
+                log.warning(f"snapshot session insert failed (non-fatal): {e}")
 
         return {
             "session_id":  snap_id,
