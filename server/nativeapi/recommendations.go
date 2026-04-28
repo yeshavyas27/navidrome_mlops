@@ -208,9 +208,12 @@ func (api *Router) getRecommendations() http.HandlerFunc {
 			trackIDs = []string{}
 		}
 
+		// UserID is the Navidrome internal nanoid (matches what the
+		// scrobbler writes into user_activity.user_id), so the model's
+		// user-embedding lookup keys consistently across train and serve.
 		reqBody := serveRecommendRequest{
-			SessionID:       "navidrome-ui-" + user.UserName,
-			UserID:          user.UserName,
+			SessionID:       "navidrome-ui-" + user.ID,
+			UserID:          user.ID,
 			TrackIDs:        trackIDs,
 			ExcludeTrackIDs: []string{},
 			TopN:            10,
