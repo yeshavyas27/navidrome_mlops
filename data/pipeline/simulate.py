@@ -198,11 +198,17 @@ def get_recommendations(user_id: str, history: List[str], top_n: int) -> List[st
     return [rec["track_id"] for rec in r.json().get("recommendations", [])]
 
 
-def post_activities(user_id: str, track_ids: List[str], base_ts: datetime) -> None:
-    """Record N plays for a user via /api/activity, ratios uniform in [0.25, 1.0]."""
+def post_activities(user_id: str, track_ids: List[str], base_ts: datetime = None) -> None:
+    """Record N plays for a user via /api/activity, ratios uniform in [0.25, 1.0].
+
+    Timestamps anchor on wall-clock NOW (with 1-second spacing inside the batch)
+    so simulated rows interleave naturally with real plays in time-series views.
+    The base_ts arg is ignored — kept for backward compatibility with callers.
+    """
+    now = datetime.now(timezone.utc)
     activities = []
     for i, tid in enumerate(track_ids):
-        ts = (base_ts + timedelta(seconds=i * 180)).isoformat()  # 3-min spacing
+        ts = (now + timedelta(seconds=i)).isoformat()
         activities.append({
             "track_id":   str(tid),
             "play_ratio": round(random.uniform(0.25, 1.0), 3),
