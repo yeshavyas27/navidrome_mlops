@@ -47,7 +47,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-          "expr": "navidrome_drift_alert{job=\"drift_monitor\", dataset_version=~\"$dataset_version\"}",
+          "expr": "navidrome_drift_alert{dataset_version=~\"$dataset_version\"}",
           "refId": "A"
         }
       ],
@@ -81,7 +81,7 @@
       "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
       "targets": [{
         "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-        "expr": "navidrome_prod_sessions_24h{job=\"drift_monitor\", dataset_version=~\"$dataset_version\"}",
+        "expr": "navidrome_prod_sessions_24h{dataset_version=~\"$dataset_version\"}",
         "refId": "A"
       }],
       "options": { "colorMode": "value", "graphMode": "area" }
@@ -94,7 +94,7 @@
       "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
       "targets": [{
         "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-        "expr": "navidrome_prod_unique_users_24h{job=\"drift_monitor\", dataset_version=~\"$dataset_version\"}",
+        "expr": "navidrome_prod_unique_users_24h{dataset_version=~\"$dataset_version\"}",
         "refId": "A"
       }],
       "options": { "colorMode": "value", "graphMode": "area" }
@@ -107,7 +107,7 @@
       "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
       "targets": [{
         "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-        "expr": "navidrome_vocab_coverage{job=\"drift_monitor\", dataset_version=~\"$dataset_version\"}",
+        "expr": "navidrome_vocab_coverage{dataset_version=~\"$dataset_version\"}",
         "refId": "A"
       }],
       "fieldConfig": {
@@ -133,7 +133,7 @@
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
       "targets": [{
         "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-        "expr": "navidrome_prod_avg_playratio{job=\"drift_monitor\", dataset_version=~\"$dataset_version\"}",
+        "expr": "navidrome_prod_avg_playratio{dataset_version=~\"$dataset_version\"}",
         "refId": "A",
         "legendFormat": "avg play ratio"
       }],
@@ -150,13 +150,13 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-          "expr": "navidrome_prod_skip_rate{job=\"drift_monitor\", dataset_version=~\"$dataset_version\"}",
+          "expr": "navidrome_prod_skip_rate{dataset_version=~\"$dataset_version\"}",
           "refId": "A",
           "legendFormat": "skip rate (ratio <= 0.25)"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-          "expr": "navidrome_prod_full_play_rate{job=\"drift_monitor\", dataset_version=~\"$dataset_version\"}",
+          "expr": "navidrome_prod_full_play_rate{dataset_version=~\"$dataset_version\"}",
           "refId": "B",
           "legendFormat": "full-play rate (ratio >= 0.75)"
         }
@@ -173,7 +173,7 @@
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
       "targets": [{
         "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-        "expr": "navidrome_session_length_drift{job=\"drift_monitor\", dataset_version=~\"$dataset_version\"}",
+        "expr": "navidrome_session_length_drift{dataset_version=~\"$dataset_version\"}",
         "refId": "A",
         "legendFormat": "|prod_avg_len - train_avg_len| / train_avg_len"
       }],
@@ -200,7 +200,7 @@
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
       "targets": [{
         "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-        "expr": "navidrome_new_user_rate{job=\"drift_monitor\", dataset_version=~\"$dataset_version\"}",
+        "expr": "navidrome_new_user_rate{dataset_version=~\"$dataset_version\"}",
         "refId": "A",
         "legendFormat": "(prod_users_24h - train_users) / train_users"
       }],
@@ -228,13 +228,13 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-          "expr": "navidrome_total_pg_sessions{job=\"drift_monitor\", dataset_version=~\"$dataset_version\"}",
+          "expr": "navidrome_total_pg_sessions{dataset_version=~\"$dataset_version\"}",
           "refId": "A",
           "legendFormat": "total sessions"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-          "expr": "navidrome_total_pg_users{job=\"drift_monitor\", dataset_version=~\"$dataset_version\"}",
+          "expr": "navidrome_total_pg_users{dataset_version=~\"$dataset_version\"}",
           "refId": "B",
           "legendFormat": "total users"
         }
