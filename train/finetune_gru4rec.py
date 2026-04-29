@@ -371,36 +371,55 @@ def check_performance_regression(
 # ============================================================
 
 DATASET_BUCKET = "navidrome-datasets"
+FALLBACK_DATASET_DATE = "20260420"   # used when no recent dataset is found
 
 
-def _latest_dataset_version(s3, max_days_back: int = 7) -> str:
+def _latest_dataset_version(s3, max_days_back: int = 14) -> str:
     """
     Find the latest dataset version folder in navidrome-datasets/datasets/.
 
     Starts from today's UTC date and walks backwards up to max_days_back days,
     looking for folders named v{YYYYMMDD}-{HHMMSS}-live. Returns the
     lexicographically latest version on the most recent date that has data.
+
+    If nothing is found within max_days_back, falls back to FALLBACK_DATASET_DATE
+    (2026-04-20) before raising.
     """
     from datetime import timedelta
     paginator = s3.get_paginator("list_objects_v2")
 
-    for days_back in range(max_days_back + 1):
-        date_str = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y%m%d")
-        prefix   = f"datasets/v{date_str}"
+    def _versions_for_date(date_str: str) -> list:
         versions = set()
-        for page in paginator.paginate(Bucket=DATASET_BUCKET, Prefix=prefix, Delimiter="/"):
+        for page in paginator.paginate(Bucket=DATASET_BUCKET, Prefix=f"datasets/v{date_str}", Delimiter="/"):
             for cp in page.get("CommonPrefixes", []):
                 part = cp["Prefix"].rstrip("/").split("/")[-1]
                 versions.add(part)
+        return sorted(versions)
+
+    for days_back in range(max_days_back + 1):
+        date_str = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y%m%d")
+        versions = _versions_for_date(date_str)
         if versions:
-            latest = sorted(versions)[-1]
+            latest = versions[-1]
             log.info(f"[minio] Latest dataset version (date={date_str}): {latest}")
             return latest
         log.info(f"[minio] No dataset found for {date_str}, checking previous day ...")
 
+    # Hard fallback: use the known-good April 20 dataset
+    log.warning(
+        f"[minio] No dataset found within the last {max_days_back} days — "
+        f"falling back to {FALLBACK_DATASET_DATE}."
+    )
+    versions = _versions_for_date(FALLBACK_DATASET_DATE)
+    if versions:
+        latest = versions[-1]
+        log.info(f"[minio] Fallback dataset version (date={FALLBACK_DATASET_DATE}): {latest}")
+        return latest
+
     raise RuntimeError(
         f"No dataset versions found in {DATASET_BUCKET}/datasets/ "
-        f"within the last {max_days_back} days. Pass --finetune-data-version explicitly."
+        f"within the last {max_days_back} days or on fallback date {FALLBACK_DATASET_DATE}. "
+        f"Pass --finetune-data-version explicitly."
     )
 
 

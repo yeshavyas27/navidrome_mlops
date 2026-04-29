@@ -66,6 +66,7 @@ git -C "$REPO_DIR" pull origin navidrome-custom
 
 docker exec -i train pip install prometheus_client
 
-docker exec -i train python3 train/finetune_gru4rec.py
+docker exec -i train python3 train/finetune_gru4rec.py \
+  ${DATA_VERSION:+--finetune-data-version "$DATA_VERSION"}
 
 echo "[finetune] done."
