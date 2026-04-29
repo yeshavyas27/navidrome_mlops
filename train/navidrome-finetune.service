@@ -1,0 +1,21 @@
+[Unit]
+Description=Navidrome GRU4Rec daily fine-tune
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=cc
+WorkingDirectory=/home/cc/navidrome_mlops
+
+# Generate a date-stamped data version, e.g. v20260428-finetune-001
+ExecStart=/bin/bash -c \
+  'DATA_VERSION="v$(date -u +%%Y%%m%%d)-finetune-001" \
+   bash /home/cc/navidrome_mlops/train/run_finetune.sh "$DATA_VERSION"'
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=navidrome-finetune
+
+# Give finetune up to 4 hours before systemd kills it
+TimeoutStartSec=14400

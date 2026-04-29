@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Navidrome GRU4Rec fine-tune daily at 22:45 UTC
+
+[Timer]
+# 10:45 PM UTC — finishes well before Argo picks up at 11:00 PM UTC
+OnCalendar=*-*-* 22:45:00 UTC
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
