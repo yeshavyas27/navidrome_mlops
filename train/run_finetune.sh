@@ -39,7 +39,7 @@ MLFLOW_URI="${MLFLOW_URI:-http://129.114.27.204:8000}"
 : "${MINIO_PASSWORD:?MINIO_PASSWORD must be set}"
 
 echo "[finetune] pulling latest code..."
-git -C "$REPO_DIR" pull origin navidrome-custom
+# git -C "$REPO_DIR" pull origin navidrome-custom
 
 # echo "[finetune] building train image (cache will make this fast)..."
 # docker build \
@@ -66,7 +66,7 @@ git -C "$REPO_DIR" pull origin navidrome-custom
 
 docker exec -i train pip install prometheus_client
 
-docker exec -i train python3 train/finetune_gru4rec.py \
+docker exec -i train python3 -u train/finetune_gru4rec.py \
   ${DATA_VERSION:+--finetune-data-version "$DATA_VERSION"}
 
 echo "[finetune] done."
