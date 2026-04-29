@@ -906,7 +906,9 @@ def parse_args():
 
     # Checkpoint source — MinIO key OR local file OR auto-discover (default)
     src = p.add_mutually_exclusive_group(required=False)
-    src.add_argument("--pretrain-model-key", help="MinIO key for model.pt. If omitted, auto-discovers latest under artifacts/finetune/ (falls back to pretrain/).")
+    src.add_argument("--pretrain-model-key",
+                     default="pretrain/2026-04-19/e3b99857810e4a35b8771a2766f8f516/model.pt",
+                     help="MinIO key for model.pt. Defaults to the 2026-04-19 pretrain run.")
     src.add_argument("--checkpoint",         help="Local pretrained model weights (.pt)")
 
     # Vocab source — MinIO key OR local file (derived from model key when auto-discovering)
