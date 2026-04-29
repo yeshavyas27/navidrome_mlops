@@ -39,7 +39,7 @@ MLFLOW_URI="${MLFLOW_URI:-http://129.114.27.204:8000}"
 : "${MINIO_PASSWORD:?MINIO_PASSWORD must be set}"
 
 echo "[finetune] pulling latest code..."
-# git -C "$REPO_DIR" pull origin navidrome-custom
+git -C "$REPO_DIR" pull origin navidrome-custom
 
 # echo "[finetune] building train image (cache will make this fast)..."
 # docker build \
